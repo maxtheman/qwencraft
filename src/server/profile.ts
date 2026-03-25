@@ -11,15 +11,42 @@ type ProfileResult = {
   rawModelOutput: string;
 };
 
-const StructuredActionSchema = Schema.Struct({
-  type: Schema.Literal("wait", "inspect_view", "move", "jump", "approach_entity"),
-  direction: Schema.optional(Schema.Literal("left", "right")),
-  distance: Schema.optional(Schema.Number),
-  strength: Schema.optional(Schema.Number),
-  entityId: Schema.optional(Schema.String),
-  stopWithin: Schema.optional(Schema.Number),
-  reason: Schema.optional(Schema.String),
-});
+const StructuredActionSchema = Schema.Union(
+  Schema.Struct({
+    type: Schema.Literal("wait"),
+    reason: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("inspect_patch"),
+    reason: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("move"),
+    direction: Schema.Literal("forward", "backward", "left", "right"),
+    steps: Schema.Number,
+    reason: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("turn"),
+    direction: Schema.Literal("left", "right"),
+    reason: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("place_block"),
+    blockType: Schema.Literal("stone", "wood", "glass"),
+    dx: Schema.Number,
+    dy: Schema.Number,
+    dz: Schema.Number,
+    reason: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("remove_block"),
+    dx: Schema.Number,
+    dy: Schema.Number,
+    dz: Schema.Number,
+    reason: Schema.optional(Schema.String),
+  }),
+);
 
 const StructuredDecisionSchema = Schema.Struct({
   thought: Schema.String,
@@ -31,28 +58,79 @@ type StructuredDecision = typeof StructuredDecisionSchema.Type;
 const structuredDecisionFormat = {
   type: "json_schema",
   json_schema: {
-    name: "brain_turn",
+    name: "builder_turn",
     strict: true,
     schema: {
       type: "object",
       properties: {
         thought: { type: "string" },
         action: {
-          type: "object",
-          properties: {
-            type: {
-              type: "string",
-              enum: ["wait", "inspect_view", "move", "jump", "approach_entity"],
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "wait" },
+                reason: { type: "string" },
+              },
+              required: ["type"],
+              additionalProperties: false,
             },
-            direction: { type: "string", enum: ["left", "right"] },
-            distance: { type: "number" },
-            strength: { type: "number" },
-            entityId: { type: "string" },
-            stopWithin: { type: "number" },
-            reason: { type: "string" },
-          },
-          required: ["type"],
-          additionalProperties: false,
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "inspect_patch" },
+                reason: { type: "string" },
+              },
+              required: ["type"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "move" },
+                direction: { type: "string", enum: ["forward", "backward", "left", "right"] },
+                steps: { type: "number" },
+                reason: { type: "string" },
+              },
+              required: ["type", "direction", "steps"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "turn" },
+                direction: { type: "string", enum: ["left", "right"] },
+                reason: { type: "string" },
+              },
+              required: ["type", "direction"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "place_block" },
+                blockType: { type: "string", enum: ["stone", "wood", "glass"] },
+                dx: { type: "number" },
+                dy: { type: "number" },
+                dz: { type: "number" },
+                reason: { type: "string" },
+              },
+              required: ["type", "blockType", "dx", "dy", "dz"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "remove_block" },
+                dx: { type: "number" },
+                dy: { type: "number" },
+                dz: { type: "number" },
+                reason: { type: "string" },
+              },
+              required: ["type", "dx", "dy", "dz"],
+              additionalProperties: false,
+            },
+          ],
         },
       },
       required: ["thought", "action"],
@@ -69,27 +147,39 @@ const structuredDecisionFormat = {
 };
 
 const baseUrl = process.env.LMSTUDIO_BASE_URL ?? "http://127.0.0.1:1234/v1";
-const model = process.env.LMSTUDIO_MODEL ?? "qwen35-agent";
+const configuredModel = process.env.LMSTUDIO_MODEL;
 const runs = Number(process.env.PROFILE_RUNS ?? "3");
+const temperature = Number(process.env.LMSTUDIO_TEMPERATURE ?? "0.1");
+const maxTokens = Number(process.env.LMSTUDIO_MAX_TOKENS ?? "80");
+const topP = Number(process.env.LMSTUDIO_TOP_P ?? "0.9");
+const imageMode = process.env.LMSTUDIO_IMAGE_MODE ?? "auto";
 
 const client = new OpenAI({
   baseURL: baseUrl,
   apiKey: process.env.LMSTUDIO_API_KEY ?? "lm-studio",
 });
 
-const readContent = (content: OpenAI.Chat.Completions.ChatCompletionMessageParam["content"] | null | undefined) => {
+const readContent = (message: OpenAI.Chat.Completions.ChatCompletionMessage) => {
+  const content = message.content;
   if (typeof content === "string") {
-    return content;
+    const trimmed = content.trim();
+    if (trimmed) {
+      return trimmed;
+    }
   }
 
   if (Array.isArray(content)) {
-    return content
+    const text = content
       .map((item) => ("text" in item ? item.text : ""))
       .join(" ")
       .trim();
+    if (text) {
+      return text;
+    }
   }
 
-  return "";
+  const reasoningContent = (message as { reasoning_content?: string }).reasoning_content?.trim();
+  return reasoningContent ?? "";
 };
 
 const decodeStructuredDecision = (rawResponse: string): StructuredDecision => {
@@ -97,76 +187,79 @@ const decodeStructuredDecision = (rawResponse: string): StructuredDecision => {
   return Schema.decodeUnknownSync(StructuredDecisionSchema)(parsed);
 };
 
+const resolveModel = async () => {
+  if (configuredModel) {
+    return configuredModel;
+  }
+  const response = await client.models.list();
+  const model = response.data.find((entry) => !entry.id.startsWith("text-embedding"))?.id;
+  if (!model) {
+    throw new Error("LM Studio returned no chat model identifiers.");
+  }
+  return model;
+};
+
 const buildMessages = (): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
   const world = createInitialWorld();
-  const alpha = world.entities.alpha;
-  const bravo = world.entities.bravo;
-  if (!alpha || !bravo) {
-    throw new Error("Expected alpha and bravo entities in profile world.");
+  const builder = world.entities.builder;
+  if (!builder) {
+    throw new Error("Expected builder entity in profile world.");
   }
-  alpha.x = 276;
-  bravo.x = 588;
-  const observation = buildObservation(world, "alpha");
 
+  const observation = buildObservation(world, "builder");
   return [
     {
       role: "system",
       content: [
-        "You are Alpha in a side-view simulation harness.",
-        "Compressed earlier context: Alpha has been trying to close on Bravo but needs cleaner jump setup.",
-        "You receive up to four recent turns of chat history plus the latest viewport image.",
-        "Return one JSON object with a short public thought and one action.",
-        "Use action.type='wait' if no action is needed.",
-        "If action.type is move or jump, include direction and distance.",
-        "If action.type is approach_entity, include entityId and stopWithin.",
-        "Prefer short moves and only jump when obstacle advisories indicate it is needed.",
-        "If the latest observation includes repeat_warning or blocked movement, do not repeat the same action and args.",
-        "When stuck, inspect_view or choose a materially different action type or direction.",
-        "Use visible entity IDs when selecting a target.",
+        "You are Builder in a tiny block-building sandbox.",
+        "There is no default build goal. Only act on the current objective from the operator.",
+        "The runtime is authoritative. Return one local action only.",
+        "Relative coordinates are in your local frame. dx is left/right, dy is forward, dz is height above the floor under you.",
+        "When viewport markers are present, use the numeric beacon markers in the image together with the viewport_markers text.",
+        "Use inspect_patch when the patch is unclear.",
         "Keep thought under 90 characters.",
       ].join("\n"),
-    },
-    {
-      role: "user",
-      content:
-        "Observation: urgent=RIGHT obstacle 64px away; jump is viable.\nself=x:232 y:360 ground:true paused:false\nvisible=bravo:right:356:los=true\nobstacles=right:64:h=64:jump=true\nlast=Movement blocked by nearby geometry.\nrecent=Movement blocked by an obstacle. | Jumped right.\nViewport image attached.",
-    },
-    {
-      role: "assistant",
-      content:
-        'thought=Bravo is close; jump over the 64px gap to maintain momentum. | action=jump | args={"direction":"right","distance":96,"strength":320} | result=Scheduled jump right for 96px at strength 320.',
     },
     {
       role: "user",
       content: [
         {
           type: "text",
-          text: `${observation.promptText}\nviewport=attached`,
+          text: `operator_directive=${builder.prompt}\n${observation.promptText}\nviewport=${imageMode === "never" ? "text-only" : "attached"}`,
         },
-        {
-          type: "image_url",
-          image_url: {
-            url: observation.viewportImageDataUrl,
-            detail: "low",
-          },
-        },
+        ...(imageMode === "never"
+          ? []
+          : [
+              {
+                type: "image_url" as const,
+                image_url: {
+                  url: observation.viewportImageDataUrl,
+                  detail: "low" as const,
+                },
+              },
+            ]),
       ],
     },
   ];
 };
 
-const runProfileTurn = async (): Promise<ProfileResult> => {
+const runProfileTurn = async (model: string): Promise<ProfileResult> => {
   const messages = buildMessages();
   const started = performance.now();
   const response = await client.chat.completions.create({
     model,
     messages,
     response_format: structuredDecisionFormat,
-    temperature: 0.2,
-    max_tokens: 96,
+    temperature,
+    top_p: topP,
+    max_tokens: Math.max(maxTokens, 120),
   });
   const totalLatencyMs = performance.now() - started;
-  const rawModelOutput = readContent(response.choices[0]?.message?.content);
+  const message = response.choices[0]?.message;
+  if (!message) {
+    throw new Error("Model returned no assistant message.");
+  }
+  const rawModelOutput = readContent(message);
   if (!rawModelOutput) {
     throw new Error("Model returned an empty structured response.");
   }
@@ -186,10 +279,11 @@ const runProfileTurn = async (): Promise<ProfileResult> => {
 const average = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
 
 const main = async () => {
+  const model = await resolveModel();
   const results: ProfileResult[] = [];
 
   for (let index = 0; index < runs; index += 1) {
-    const result = await runProfileTurn();
+    const result = await runProfileTurn(model);
     results.push(result);
     console.log(
       [

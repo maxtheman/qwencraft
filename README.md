@@ -1,49 +1,94 @@
-# Agent Harness Debug Runtime
+# Qwencraft
 
-First-pass local LLM simulation harness:
+`qwencraft` is a local LLM-driven block-building sandbox.
 
-- Effect-driven physics tick and per-entity brain loops
-- Debug room UI in React/Vite
-- LM Studio via OpenAI-compatible API
-- Stub brain fallback when LM Studio is unavailable
+The current repo proves the loop:
 
-Docs:
+- Effect-driven simulation and agent turns
+- LM Studio integration over the OpenAI-compatible API
+- a game-first isometric sandbox UI
+- local relative tools instead of raw world mutation
+- trace capture for prompts, raw model output, chosen action, and result
+- beacon authoring and model-visible world markers
+- a headless harness for repeatable behavior testing
 
-- Scope and original POC target: [docs/poc-scope.md](/Users/max/Documents/agent_game/docs/poc-scope.md)
-- Current architecture and direction: [docs/current-direction.md](/Users/max/Documents/agent_game/docs/current-direction.md)
+## The Next Step
+
+The next step is not more UI polish or more hidden runtime automation. It is to make the model materially better at multi-step building.
+
+Right now the model has enough information for a legal local move, but not enough well-shaped task state to reliably build coherent structures over several turns. The system should evolve toward:
+
+1. `objective_progress`
+   A compact, task-specific progress view derived from the current objective and current world state.
+
+2. `candidate_actions`
+   A small set of legal next actions with expected effects, so the model chooses between meaningful options instead of inventing coordinates from scratch every turn.
+
+3. better short-term plan memory
+   Keep the fixed system prompt stable, but preserve the last few turns plus a compact plan summary so the agent can continue a shape instead of re-deciding from zero.
+
+4. headless evaluation as the primary loop
+   Use the headless harness to score concrete tasks like rows, pads, towers, and beacon-directed builds before judging behavior in the UI.
+
+The design goal is a model-driven sandbox that stays honest:
+
+- no secret objective solver
+- no hidden shape completion fallback
+- runtime remains authoritative about legality
+- the model remains responsible for choosing the next action
+
+## Current Tool Surface
+
+- `inspect_patch()`
+- `move(direction, steps)`
+- `turn(direction)`
+- `place_block(blockType, dx, dy, dz)`
+- `remove_block(dx, dy, dz)`
 
 ## Run
 
-1. Start LM Studio local server if you want real model turns.
-2. Optional: copy `.env.example` values into your shell.
-3. Install dependencies:
+1. Install dependencies:
 
 ```bash
 npm install
 ```
 
-4. Start the app:
+2. Start LM Studio if you want real model turns.
+
+3. Start the app:
 
 ```bash
 npm run dev
 ```
 
-- Debug UI: `http://127.0.0.1:5173` or the next free Vite port
+- UI: `http://127.0.0.1:5173` or the next free Vite port
 - API: `http://127.0.0.1:3001/api/state`
 
-## Profile LM Studio
+## Headless Harness
 
-Run the direct profiler against the loaded LM Studio model:
+Run the LM-backed headless evaluator:
+
+```bash
+npm run harness:headless
+```
+
+Useful overrides:
+
+- `LMSTUDIO_MODEL`
+- `LMSTUDIO_BASE_URL`
+- `LMSTUDIO_TOOL_MODE`
+- `LMSTUDIO_IMAGE_MODE`
+- `LMSTUDIO_TEMPERATURE`
+- `LMSTUDIO_MAX_TOKENS`
+- `LMSTUDIO_TOP_P`
+
+## Direct Profiling
+
+Run the direct LM Studio profiler:
 
 ```bash
 npm run profile:lmstudio
 ```
-
-Optional overrides:
-
-- `LMSTUDIO_MODEL`
-- `LMSTUDIO_BASE_URL`
-- `PROFILE_RUNS`
 
 ## Environment
 
@@ -53,35 +98,28 @@ Optional overrides:
   - optional; if omitted the server tries to use the first loaded model
 - `LMSTUDIO_API_KEY`
   - default: `lm-studio`
+- `LMSTUDIO_TOOL_MODE`
+  - `auto`, `native`, or `json`
+  - default: `auto`
+- `LMSTUDIO_IMAGE_MODE`
+  - `auto`, `always`, or `never`
+  - default: `auto`
+- `LMSTUDIO_TEMPERATURE`
+  - default: `0.1`
+- `LMSTUDIO_MAX_TOKENS`
+  - default: `80`
+- `LMSTUDIO_TOP_P`
+  - default: `0.9`
 - `PORT`
   - default: `3001`
 
-## Current Tool Surface
+## Docs
 
-- `inspect_view()`
-- `move(direction, distance)`
-- `jump(direction, distance, strength)`
-- `approach_entity(entityId, stopWithin)`
-
-The LM Studio path now asks for one structured JSON decision per turn:
-
-- public `thought`
-- one `action`
-
-The runtime then executes that action locally and records a trace.
-
-## What This First Pass Proves
-
-- the Effect runtime can drive concurrent entities
-- prompt edits are hot-swappable
-- per-entity pause/resume works
-- obstacle hints and visible entity ids are fed into the agent loop
-- movement is distance-based rather than anchor-based
-- viewport images can be attached to LM Studio turns
-- per-turn traces capture the prompt, raw model output, executed action, and latency
+- [docs/poc-scope.md](/Users/max/Documents/agent_game/docs/poc-scope.md)
+- [docs/current-direction.md](/Users/max/Documents/agent_game/docs/current-direction.md)
+- [docs/block-world-pivot.md](/Users/max/Documents/agent_game/docs/block-world-pivot.md)
 
 ## Notes
 
-- If LM Studio is not reachable, the system falls back to a deterministic stub policy and keeps the sim running.
-- The current UI is a debug surface, not the final PixiJS renderer.
+- If LM Studio is not reachable, the system falls back to a deterministic stub policy.
 - The repo is compiled with `strict`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, and `noImplicitReturns`.

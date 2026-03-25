@@ -1,7 +1,10 @@
 import { Schema } from "effect";
 
 export type RuntimeMode = "lmstudio" | "stub";
-export type Direction = "left" | "right";
+export type Facing = "north" | "east" | "south" | "west";
+export type MoveDirection = "forward" | "backward" | "left" | "right";
+export type TurnDirection = "left" | "right";
+export type BlockType = "grass" | "stone" | "wood" | "glass";
 export type EntityStatus = "idle" | "thinking" | "moving" | "paused" | "error";
 
 export interface ToolRecord {
@@ -9,12 +12,18 @@ export interface ToolRecord {
   args: unknown;
 }
 
-export interface ObstacleSnapshot {
+export interface BlockSnapshot {
+  x: number;
+  y: number;
+  z: number;
+  type: BlockType;
+}
+
+export interface BeaconSnapshot {
   id: string;
   x: number;
   y: number;
-  width: number;
-  height: number;
+  label: string;
 }
 
 export interface EntitySnapshot {
@@ -24,18 +33,16 @@ export interface EntitySnapshot {
   prompt: string;
   visibleThought: string;
   status: EntityStatus;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  onGround: boolean;
+  gridX: number;
+  gridY: number;
+  gridZ: number;
+  facing: Facing;
   paused: boolean;
   memorySummary: string;
   lastObservation: string;
   lastToolCall?: ToolRecord | undefined;
   lastActionResult?: string | undefined;
   lastViewportImageDataUrl?: string | undefined;
-  targetEntityId?: string | undefined;
   recentEvents: readonly string[];
   threadLength: number;
   traces: readonly BrainTraceSnapshot[];
@@ -60,10 +67,11 @@ export interface WorldMetricsSnapshot {
 
 export interface WorldSnapshot {
   generatedAt: number;
-  width: number;
-  height: number;
-  floorY: number;
-  obstacles: readonly ObstacleSnapshot[];
+  gridWidth: number;
+  gridDepth: number;
+  gridHeight: number;
+  blocks: readonly BlockSnapshot[];
+  beacons: readonly BeaconSnapshot[];
   entities: readonly EntitySnapshot[];
   llm: LlmStatusSnapshot;
   metrics: WorldMetricsSnapshot;
@@ -77,6 +85,12 @@ export interface EntityPatchRequest {
 
 export interface ErrorResponse {
   error?: string | undefined;
+}
+
+export interface BeaconUpsertRequest {
+  x: number;
+  y: number;
+  label: string;
 }
 
 export interface BrainTraceSnapshot {
@@ -96,7 +110,10 @@ export interface BrainTraceSnapshot {
 }
 
 export const RuntimeModeSchema = Schema.Literal("lmstudio", "stub");
-export const DirectionSchema = Schema.Literal("left", "right");
+export const FacingSchema = Schema.Literal("north", "east", "south", "west");
+export const MoveDirectionSchema = Schema.Literal("forward", "backward", "left", "right");
+export const TurnDirectionSchema = Schema.Literal("left", "right");
+export const BlockTypeSchema = Schema.Literal("grass", "stone", "wood", "glass");
 export const EntityStatusSchema = Schema.Literal("idle", "thinking", "moving", "paused", "error");
 
 export const ToolRecordSchema = Schema.Struct({
@@ -104,12 +121,18 @@ export const ToolRecordSchema = Schema.Struct({
   args: Schema.Unknown,
 });
 
-export const ObstacleSnapshotSchema = Schema.Struct({
+export const BlockSnapshotSchema = Schema.Struct({
+  x: Schema.Number,
+  y: Schema.Number,
+  z: Schema.Number,
+  type: BlockTypeSchema,
+});
+
+export const BeaconSnapshotSchema = Schema.Struct({
   id: Schema.String,
   x: Schema.Number,
   y: Schema.Number,
-  width: Schema.Number,
-  height: Schema.Number,
+  label: Schema.String,
 });
 
 export const EntitySnapshotSchema = Schema.Struct({
@@ -119,18 +142,16 @@ export const EntitySnapshotSchema = Schema.Struct({
   prompt: Schema.String,
   visibleThought: Schema.String,
   status: EntityStatusSchema,
-  x: Schema.Number,
-  y: Schema.Number,
-  width: Schema.Number,
-  height: Schema.Number,
-  onGround: Schema.Boolean,
+  gridX: Schema.Number,
+  gridY: Schema.Number,
+  gridZ: Schema.Number,
+  facing: FacingSchema,
   paused: Schema.Boolean,
   memorySummary: Schema.String,
   lastObservation: Schema.String,
   lastToolCall: Schema.optional(ToolRecordSchema),
   lastActionResult: Schema.optional(Schema.String),
   lastViewportImageDataUrl: Schema.optional(Schema.String),
-  targetEntityId: Schema.optional(Schema.String),
   recentEvents: Schema.Array(Schema.String),
   threadLength: Schema.Number,
   traces: Schema.Array(
@@ -171,10 +192,11 @@ export const WorldMetricsSnapshotSchema = Schema.Struct({
 
 export const WorldSnapshotSchema = Schema.Struct({
   generatedAt: Schema.Number,
-  width: Schema.Number,
-  height: Schema.Number,
-  floorY: Schema.Number,
-  obstacles: Schema.Array(ObstacleSnapshotSchema),
+  gridWidth: Schema.Number,
+  gridDepth: Schema.Number,
+  gridHeight: Schema.Number,
+  blocks: Schema.Array(BlockSnapshotSchema),
+  beacons: Schema.Array(BeaconSnapshotSchema),
   entities: Schema.Array(EntitySnapshotSchema),
   llm: LlmStatusSnapshotSchema,
   metrics: WorldMetricsSnapshotSchema,
@@ -190,6 +212,13 @@ export const ErrorResponseSchema = Schema.Struct({
   error: Schema.optional(Schema.String),
 });
 
+export const BeaconUpsertRequestSchema = Schema.Struct({
+  x: Schema.Number,
+  y: Schema.Number,
+  label: Schema.String,
+});
+
 export const decodeWorldSnapshot = Schema.decodeUnknownSync(WorldSnapshotSchema);
 export const decodeEntityPatchRequest = Schema.decodeUnknownSync(EntityPatchRequestSchema);
 export const decodeErrorResponse = Schema.decodeUnknownSync(ErrorResponseSchema);
+export const decodeBeaconUpsertRequest = Schema.decodeUnknownSync(BeaconUpsertRequestSchema);

@@ -1,10 +1,15 @@
 import { Ref } from "effect";
 import type {
+  BeaconSnapshot,
+  BlockSnapshot,
+  BlockType,
   BrainTraceSnapshot,
-  Direction,
   EntitySnapshot,
   EntityStatus,
+  Facing,
+  MoveDirection,
   ToolRecord,
+  TurnDirection,
   WorldSnapshot,
 } from "../shared/contracts";
 import type { LlmStatus } from "./lmstudio";
@@ -15,29 +20,22 @@ export type ThreadMessage = {
   content: string;
 };
 
-type Obstacle = {
+type BuildBlockType = Exclude<BlockType, "grass">;
+
+type BeaconState = {
   id: string;
   x: number;
   y: number;
-  width: number;
-  height: number;
+  label: string;
 };
 
-type WalkIntent = {
-  kind: "walk";
-  direction: Direction;
-  remaining: number;
+type ReachableCell = {
+  dx: number;
+  dy: number;
+  dz: number;
+  current: BlockType | "empty";
+  supported: boolean;
 };
-
-type JumpIntent = {
-  kind: "jump";
-  direction: Direction;
-  remaining: number;
-  strength: number;
-  launched: boolean;
-};
-
-type MoveIntent = WalkIntent | JumpIntent;
 
 type EntityState = {
   id: string;
@@ -46,26 +44,20 @@ type EntityState = {
   prompt: string;
   visibleThought: string;
   status: EntityStatus;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  vx: number;
-  vy: number;
-  onGround: boolean;
+  gridX: number;
+  gridY: number;
+  gridZ: number;
+  facing: Facing;
   paused: boolean;
-  lastBrainSampleX: number;
-  lastBrainSampleY: number;
   memorySummary: string;
   lastObservation: string;
   lastToolCall?: ToolRecord;
   lastActionResult?: string;
   lastViewportImageDataUrl?: string;
-  targetEntityId?: string;
   recentEvents: string[];
   thread: ThreadMessage[];
   traces: BrainTraceSnapshot[];
-  intent?: MoveIntent;
+  objectiveRevision: number;
 };
 
 type MetricsState = {
@@ -78,44 +70,38 @@ type MetricsState = {
 };
 
 type WorldState = {
-  width: number;
-  height: number;
-  floorY: number;
-  obstacles: Obstacle[];
+  gridWidth: number;
+  gridDepth: number;
+  gridHeight: number;
+  blocks: Record<string, BlockType>;
+  beacons: Record<string, BeaconState>;
   entities: Record<string, EntityState>;
   metrics: MetricsState;
 };
 
-type RayObstacleHint = {
-  direction: Direction;
-  distance: number;
-  height: number;
-  jumpRecommended: boolean;
-};
-
-export type VisibleEntity = {
-  id: string;
-  name: string;
-  distance: number;
-  direction: Direction;
-  lineOfSight: boolean;
-};
-
 export type ViewObservation = {
   promptText: string;
-  visibleEntities: VisibleEntity[];
-  obstacleHints: RayObstacleHint[];
-  urgentHints: string[];
+  inspectText: string;
   viewportImageDataUrl: string;
+  self: {
+    x: number;
+    y: number;
+    z: number;
+    facing: Facing;
+  };
+  builtCounts: Record<BuildBlockType, number>;
+  reachableCells: ReachableCell[];
 };
 
 export type ToolInvocation =
-  | { name: "inspect_view"; args: Record<string, never> }
-  | { name: "move"; args: { direction: Direction; distance: number } }
-  | { name: "jump"; args: { direction: Direction; distance: number; strength: number } }
-  | { name: "approach_entity"; args: { entityId: string; stopWithin: number } };
+  | { name: "inspect_patch"; args: Record<string, never> }
+  | { name: "move"; args: { direction: MoveDirection; steps: number } }
+  | { name: "turn"; args: { direction: TurnDirection } }
+  | { name: "place_block"; args: { blockType: BuildBlockType; dx: number; dy: number; dz: number } }
+  | { name: "remove_block"; args: { dx: number; dy: number; dz: number } };
 
 export type BrainResult = {
+  objectiveRevision: number;
   thought: string;
   threadEntries: ThreadMessage[];
   toolCall?: ToolInvocation;
@@ -134,25 +120,19 @@ export type WorldRef = Ref.Ref<WorldState>;
 
 const PHYSICS_WINDOW_MS = 5_000;
 const METRIC_SAMPLE_LIMIT = 40;
-const WALK_SPEED = 130;
-const AIR_SPEED = 110;
-const GRAVITY = 780;
-const DEFAULT_WIDTH = 1100;
-const DEFAULT_HEIGHT = 420;
-const DEFAULT_FLOOR_Y = 360;
-const VIEWPORT_WORLD_WIDTH = 420;
-const VIEWPORT_WORLD_HEIGHT = 240;
-const THREAD_MESSAGE_LIMIT = 8;
-const MEMORY_SUMMARY_LIMIT = 320;
-const ROOM_FRAME_INSET = 18;
-const ROOM_CONTENT_PADDING = 12;
-
-const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
-
+const THREAD_MESSAGE_LIMIT = 4;
+const MEMORY_SUMMARY_LIMIT = 220;
+const GRID_WIDTH = 12;
+const GRID_DEPTH = 12;
+const GRID_HEIGHT = 6;
+const REACH_DX = [-1, 0, 1] as const;
+const REACH_DY = [0, 1, 2, 3] as const;
+const REACH_DZ = [0, 1, 2, 3] as const;
+const BUILD_BLOCK_TYPES: readonly BuildBlockType[] = ["stone", "wood", "glass"];
 const clipThought = (value: string) => {
   const compact = value.replace(/\s+/g, " ").trim();
   if (compact.length <= 88) {
-    return compact || "Waiting for a better angle.";
+    return compact || "Awaiting an objective.";
   }
   return `${compact.slice(0, 85).trimEnd()}...`;
 };
@@ -169,6 +149,9 @@ const pushEvent = (entity: EntityState, event: string) => {
 const pushTrace = (entity: EntityState, trace: BrainTraceSnapshot) => {
   entity.traces = [trace, ...entity.traces].slice(0, 8);
 };
+
+const sameToolCall = (left: ToolRecord | undefined, right: ToolInvocation) =>
+  left?.name === right.name && JSON.stringify(left.args) === JSON.stringify(right.args);
 
 const clipMemory = (value: string) => value.replace(/\s+/g, " ").trim();
 
@@ -189,14 +172,7 @@ const summarizeDroppedThreadMessage = (message: ThreadMessage) => {
   if (message.role === "assistant") {
     return `assistant:${compact.slice(0, 120)}`;
   }
-
-  const interestingLines = compact
-    .split(/(?=urgent=|visible=|obstacles=|last=|repeat_warning=)/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .slice(0, 3)
-    .join(" | ");
-  return `user:${(interestingLines || compact).slice(0, 120)}`;
+  return `user:${compact.slice(0, 120)}`;
 };
 
 const mergeCompressedMemory = (existing: string, droppedMessages: readonly ThreadMessage[]) => {
@@ -208,10 +184,7 @@ const mergeCompressedMemory = (existing: string, droppedMessages: readonly Threa
     .split(" || ")
     .map((segment) => segment.trim())
     .filter((segment) => segment.length > 0);
-  const nextSegments = [
-    ...existingSegments,
-    ...droppedMessages.map(summarizeDroppedThreadMessage),
-  ];
+  const nextSegments = [...existingSegments, ...droppedMessages.map(summarizeDroppedThreadMessage)];
   return takeLastSegments(nextSegments, MEMORY_SUMMARY_LIMIT).join(" || ") || "No summary yet.";
 };
 
@@ -236,258 +209,232 @@ const getEntityOrThrow = (world: Pick<WorldState, "entities">, entityId: string)
   return entity;
 };
 
-const entityRect = (entity: Pick<EntityState, "x" | "y" | "width" | "height">) => ({
-  left: entity.x - entity.width / 2,
-  right: entity.x + entity.width / 2,
-  top: entity.y - entity.height,
-  bottom: entity.y,
-});
+const blockKey = (x: number, y: number, z: number) => `${x},${y},${z}`;
 
-const rectsOverlap = (
-  a: { left: number; right: number; top: number; bottom: number },
-  b: { left: number; right: number; top: number; bottom: number },
-) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
-
-const obstacleRect = (obstacle: Obstacle) => ({
-  left: obstacle.x,
-  right: obstacle.x + obstacle.width,
-  top: obstacle.y,
-  bottom: obstacle.y + obstacle.height,
-});
-
-const resolveHorizontal = (entity: EntityState, dx: number, obstacles: Obstacle[]) => {
-  if (dx === 0) {
-    return { x: entity.x, blocked: false };
+const parseBlockKey = (key: string) => {
+  const [rawX, rawY, rawZ] = key.split(",");
+  if (rawX === undefined || rawY === undefined || rawZ === undefined) {
+    throw new Error(`Invalid block key: ${key}`);
   }
-
-  const next = { ...entity, x: entity.x + dx };
-  const nextRect = entityRect(next);
-
-  for (const obstacle of obstacles) {
-    if (rectsOverlap(nextRect, obstacleRect(obstacle))) {
-      return { x: entity.x, blocked: true };
-    }
-  }
-
-  return { x: entity.x + dx, blocked: false };
+  return {
+    x: Number(rawX),
+    y: Number(rawY),
+    z: Number(rawZ),
+  };
 };
 
-const resolveVertical = (entity: EntityState, dy: number, obstacles: Obstacle[], floorY: number) => {
-  let nextY = entity.y + dy;
-  let onGround = false;
-  let hitCeiling = false;
-  const currentRect = entityRect(entity);
-  const nextRect = entityRect({ ...entity, y: nextY });
+const isInsideGrid = (world: Pick<WorldState, "gridWidth" | "gridDepth" | "gridHeight">, x: number, y: number, z: number) =>
+  x >= 0 && x < world.gridWidth && y >= 0 && y < world.gridDepth && z >= 0 && z < world.gridHeight;
 
-  if (dy >= 0 && nextY >= floorY) {
-    return { y: floorY, onGround: true, hitCeiling: false };
-  }
+const getBlock = (world: Pick<WorldState, "blocks">, x: number, y: number, z: number) => world.blocks[blockKey(x, y, z)];
 
-  let landingY: number | undefined;
-  let ceilingY: number | undefined;
+const beaconList = (world: Pick<WorldState, "beacons">) =>
+  Object.values(world.beacons).sort((a, b) => a.y - b.y || a.x - b.x || a.label.localeCompare(b.label));
 
-  for (const obstacle of obstacles) {
-    const rect = obstacleRect(obstacle);
-    if (!rectsOverlap(nextRect, rect)) {
-      continue;
-    }
-
-    if (dy > 0 && currentRect.bottom <= rect.top) {
-      const candidate = rect.top;
-      if (landingY === undefined || candidate < landingY) {
-        landingY = candidate;
-        onGround = true;
-      }
-    } else if (dy < 0 && currentRect.top >= rect.bottom) {
-      const candidate = rect.bottom + entity.height;
-      if (ceilingY === undefined || candidate > ceilingY) {
-        ceilingY = candidate;
-        hitCeiling = true;
-      }
-    }
-  }
-
-  if (landingY !== undefined) {
-    nextY = landingY;
-  } else if (ceilingY !== undefined) {
-    nextY = ceilingY;
-  }
-
-  return { y: nextY, onGround, hitCeiling };
-};
-
-const ccw = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number) =>
-  (cy - ay) * (bx - ax) > (by - ay) * (cx - ax);
-
-const segmentsIntersect = (
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  cx: number,
-  cy: number,
-  dx: number,
-  dy: number,
-) => ccw(ax, ay, cx, cy, dx, dy) !== ccw(bx, by, cx, cy, dx, dy) && ccw(ax, ay, bx, by, cx, cy) !== ccw(ax, ay, bx, by, dx, dy);
-
-const pointInRect = (x: number, y: number, rect: ReturnType<typeof obstacleRect>) =>
-  x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-
-const lineIntersectsRect = (
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  obstacle: Obstacle,
-) => {
-  const rect = obstacleRect(obstacle);
-  if (pointInRect(ax, ay, rect) || pointInRect(bx, by, rect)) {
-    return true;
-  }
-
-  const edges: Array<[number, number, number, number]> = [
-    [rect.left, rect.top, rect.right, rect.top],
-    [rect.right, rect.top, rect.right, rect.bottom],
-    [rect.right, rect.bottom, rect.left, rect.bottom],
-    [rect.left, rect.bottom, rect.left, rect.top],
-  ];
-
-  return edges.some(([cx, cy, dx, dy]) => segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy));
-};
-
-const findNearestObstacle = (entity: EntityState, direction: Direction, obstacles: Obstacle[]): RayObstacleHint | undefined => {
-  const rect = entityRect(entity);
-  const candidates = obstacles
-    .map((obstacle) => {
-      const obsRect = obstacleRect(obstacle);
-      const verticalOverlap = obsRect.bottom > rect.top && obsRect.top < rect.bottom;
-      if (!verticalOverlap) {
-        return undefined;
-      }
-
-      if (direction === "right" && obsRect.left >= rect.right) {
-        return {
-          direction,
-          distance: Math.round(obsRect.left - rect.right),
-          height: obstacle.height,
-          jumpRecommended: obstacle.height <= 120,
-        };
-      }
-
-      if (direction === "left" && obsRect.right <= rect.left) {
-        return {
-          direction,
-          distance: Math.round(rect.left - obsRect.right),
-          height: obstacle.height,
-          jumpRecommended: obstacle.height <= 120,
-        };
-      }
-
-      return undefined;
+const formatBeaconObservation = (world: Pick<WorldState, "beacons">, entity: Pick<EntityState, "facing" | "gridX" | "gridY">) =>
+  beaconList(world)
+    .map((beacon, index) => {
+      const local = toLocalDelta(entity.facing, beacon.x - entity.gridX, beacon.y - entity.gridY);
+      return `${index + 1}:${beacon.label}@(${beacon.x},${beacon.y}) local=(${local.dx},${local.dy})`;
     })
-    .filter((candidate): candidate is RayObstacleHint => Boolean(candidate))
-    .sort((a, b) => a.distance - b.distance);
+    .join(" | ");
 
-  return candidates[0];
+const setBlock = (world: WorldState, x: number, y: number, z: number, blockType: BlockType) => {
+  world.blocks[blockKey(x, y, z)] = blockType;
 };
 
-const buildViewportImageDataUrl = (world: WorldState, entityId: string) => {
-  const entity = getEntityOrThrow(world, entityId);
-  const cameraLeft = clamp(entity.x - VIEWPORT_WORLD_WIDTH / 2, 0, world.width - VIEWPORT_WORLD_WIDTH);
-  const cameraTop = clamp(entity.y - entity.height - VIEWPORT_WORLD_HEIGHT / 2, 0, world.height - VIEWPORT_WORLD_HEIGHT);
-
-  return renderViewportPngDataUrl({
-    worldWidth: world.width,
-    worldHeight: world.height,
-    floorY: world.floorY,
-    cameraLeft,
-    cameraTop,
-    cameraWidth: VIEWPORT_WORLD_WIDTH,
-    cameraHeight: VIEWPORT_WORLD_HEIGHT,
-    obstacles: world.obstacles,
-    entities: Object.values(world.entities)
-      .filter((candidate) => {
-        const left = candidate.x - candidate.width / 2;
-        const right = candidate.x + candidate.width / 2;
-        const top = candidate.y - candidate.height;
-        const bottom = candidate.y;
-        return (
-          right >= cameraLeft &&
-          left <= cameraLeft + VIEWPORT_WORLD_WIDTH &&
-          bottom >= cameraTop &&
-          top <= cameraTop + VIEWPORT_WORLD_HEIGHT
-        );
-      })
-      .map((candidate) => ({
-        id: candidate.id,
-        x: candidate.x,
-        y: candidate.y,
-        width: candidate.width,
-        height: candidate.height,
-        color: candidate.color,
-        isSelf: candidate.id === entityId,
-      })),
-  });
+const removeBlock = (world: WorldState, x: number, y: number, z: number) => {
+  delete world.blocks[blockKey(x, y, z)];
 };
+
+const highestSolidZ = (world: WorldState, x: number, y: number) => {
+  for (let z = world.gridHeight - 1; z >= 0; z -= 1) {
+    if (getBlock(world, x, y, z)) {
+      return z;
+    }
+  }
+  return -1;
+};
+
+const countBuiltBlocks = (world: WorldState): Record<BuildBlockType, number> => {
+  const counts: Record<BuildBlockType, number> = { stone: 0, wood: 0, glass: 0 };
+  for (const blockType of Object.values(world.blocks)) {
+    if (blockType !== "grass") {
+      counts[blockType] += 1;
+    }
+  }
+  return counts;
+};
+
+const toWorldDelta = (facing: Facing, dx: number, dy: number) => {
+  switch (facing) {
+    case "north":
+      return { x: dx, y: -dy };
+    case "east":
+      return { x: dy, y: dx };
+    case "south":
+      return { x: -dx, y: dy };
+    case "west":
+      return { x: -dy, y: -dx };
+  }
+};
+
+const toLocalDelta = (facing: Facing, deltaX: number, deltaY: number) => {
+  switch (facing) {
+    case "north":
+      return { dx: deltaX, dy: -deltaY };
+    case "east":
+      return { dx: deltaY, dy: deltaX };
+    case "south":
+      return { dx: -deltaX, dy: deltaY };
+    case "west":
+      return { dx: -deltaY, dy: -deltaX };
+  }
+};
+
+const turnFacing = (facing: Facing, direction: TurnDirection): Facing => {
+  const order: readonly Facing[] = ["north", "east", "south", "west"];
+  const index = order.indexOf(facing);
+  const nextIndex = direction === "right" ? (index + 1) % order.length : (index + order.length - 1) % order.length;
+  return order[nextIndex]!;
+};
+
+const moveDeltaForDirection = (facing: Facing, direction: MoveDirection) => {
+  switch (direction) {
+    case "forward":
+      return toWorldDelta(facing, 0, 1);
+    case "backward":
+      return toWorldDelta(facing, 0, -1);
+    case "left":
+      return toWorldDelta(facing, -1, 0);
+    case "right":
+      return toWorldDelta(facing, 1, 0);
+  }
+};
+
+const clipObservationText = (value: string, maxLength: number) => {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+  return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+};
+
+const simulateMoveStep = (world: WorldState, entity: EntityState, direction: MoveDirection) => {
+  const delta = moveDeltaForDirection(entity.facing, direction);
+  const targetX = entity.gridX + delta.x;
+  const targetY = entity.gridY + delta.y;
+  if (!isInsideGrid(world, targetX, targetY, 0)) {
+    return `${direction}:edge`;
+  }
+
+  const targetStandZ = highestSolidZ(world, targetX, targetY) + 1;
+  if (targetStandZ < 1 || targetStandZ >= world.gridHeight) {
+    return `${direction}:void`;
+  }
+  if (Math.abs(targetStandZ - entity.gridZ) > 1) {
+    return `${direction}:steep`;
+  }
+
+  return `${direction}:ok@(${targetX},${targetY},${targetStandZ})`;
+};
+
+const buildReachableCells = (world: WorldState, entity: EntityState): ReachableCell[] => {
+  const baseSurfaceZ = entity.gridZ - 1;
+  const cells: ReachableCell[] = [];
+
+  for (const dx of REACH_DX) {
+    for (const dy of REACH_DY) {
+      for (const dz of REACH_DZ) {
+        const worldDelta = toWorldDelta(entity.facing, dx, dy);
+        const targetX = entity.gridX + worldDelta.x;
+        const targetY = entity.gridY + worldDelta.y;
+        const targetZ = baseSurfaceZ + dz;
+        if (!isInsideGrid(world, targetX, targetY, targetZ)) {
+          continue;
+        }
+        const current = getBlock(world, targetX, targetY, targetZ) ?? "empty";
+        const supported = targetZ === 0 || Boolean(getBlock(world, targetX, targetY, targetZ - 1));
+        cells.push({ dx, dy, dz, current, supported });
+      }
+    }
+  }
+
+  return cells;
+};
+
+const inspectPatchText = (world: WorldState, entity: EntityState, reachableCells: readonly ReachableCell[]) => {
+  const counts = countBuiltBlocks(world);
+  const beaconsText = formatBeaconObservation(world, entity);
+  return [
+    `self=(${entity.gridX},${entity.gridY},${entity.gridZ}) facing=${entity.facing}`,
+    `built_counts=stone:${counts.stone} wood:${counts.wood} glass:${counts.glass}`,
+    `beacons=${beaconsText || "none"}`,
+    `reachable_cells=${reachableCells
+      .map((cell) => `(${cell.dx},${cell.dy},${cell.dz})=${cell.current}:${cell.supported ? "supported" : "floating"}`)
+      .join(" | ")}`,
+  ].join("\n");
+};
+
+const formatCellList = (cells: readonly ReachableCell[], includeType = false) =>
+  cells
+    .map((cell) =>
+      includeType
+        ? `(${cell.dx},${cell.dy},${cell.dz})=${cell.current}`
+        : `(${cell.dx},${cell.dy},${cell.dz})`,
+    )
+    .join(" | ");
+
+const sortCellsForBuild = (cells: readonly ReachableCell[]) =>
+  [...cells].sort(
+    (left, right) => left.dy - right.dy || Math.abs(left.dx) - Math.abs(right.dx) || left.dx - right.dx || left.dz - right.dz,
+  );
+
+const buildObjectiveHint = (objective: string) => {
+  const normalized = objective.toLowerCase();
+  if (/(row|line)\b/.test(normalized)) {
+    return "For a row, place only on empty supported cells at dz=1. After a successful placement, move or choose a different empty supported cell.";
+  }
+  if (/\b(2x2|square|pad|platform)\b/.test(normalized)) {
+    return "For a pad, fill adjacent empty supported cells at dz=1. Do not stack upward unless the objective asks for height.";
+  }
+  if (/\b(tower|column|pillar|stack)\b/.test(normalized)) {
+    return "For a tower, keep one local (dx,dy) and increase dz upward through supported cells.";
+  }
+  if (/\b(remove|clear|delete)\b/.test(normalized)) {
+    return "For removal, use only removable_cells. Do not target grass.";
+  }
+  return "Use only buildable_cells for place_block and removable_cells for remove_block.";
+};
+
+const isBuilderOccupiedLocalCell = (cell: Pick<ReachableCell, "dx" | "dy" | "dz">) => cell.dx === 0 && cell.dy === 0 && cell.dz === 1;
 
 export const createInitialWorld = (): WorldState => {
   const world: WorldState = {
-    width: DEFAULT_WIDTH,
-    height: DEFAULT_HEIGHT,
-    floorY: DEFAULT_FLOOR_Y,
-    obstacles: [
-      { id: "block-a", x: 290, y: 296, width: 92, height: 64 },
-      { id: "pillar-b", x: 615, y: 250, width: 74, height: 110 },
-      { id: "platform-c", x: 800, y: 230, width: 140, height: 18 },
-    ],
+    gridWidth: GRID_WIDTH,
+    gridDepth: GRID_DEPTH,
+    gridHeight: GRID_HEIGHT,
+    blocks: {},
+    beacons: {},
     entities: {
-      alpha: {
-        id: "alpha",
-        name: "Alpha",
+      builder: {
+        id: "builder",
+        name: "Builder",
         color: "#f97316",
-        prompt:
-          "You are Alpha, a practical scout. Prefer closing distance to visible entities and narrate brief tactical thoughts.",
-        visibleThought: "Spinning up.",
-        status: "idle",
-        x: 120,
-        y: DEFAULT_FLOOR_Y,
-        width: 28,
-        height: 40,
-        vx: 0,
-        vy: 0,
-        onGround: true,
-        paused: false,
-        lastBrainSampleX: 120,
-        lastBrainSampleY: DEFAULT_FLOOR_Y,
-        memorySummary: "Alpha starts near the left wall.",
-        lastObservation: "Booting simulation.",
-        recentEvents: ["Booted into the habitat room."],
+        prompt: "",
+        visibleThought: "Awaiting an objective.",
+        status: "paused",
+        gridX: 4,
+        gridY: 6,
+        gridZ: 1,
+        facing: "east",
+        paused: true,
+        memorySummary: "No objective yet.",
+        lastObservation: "Paused at launch.",
+        recentEvents: ["Paused at launch."],
         thread: [],
         traces: [],
-      },
-      bravo: {
-        id: "bravo",
-        name: "Bravo",
-        color: "#38bdf8",
-        prompt:
-          "You are Bravo, a curious analyst. Inspect the space, keep an eye on Alpha, and prefer line-of-sight positioning.",
-        visibleThought: "Watching the room.",
-        status: "idle",
-        x: 880,
-        y: DEFAULT_FLOOR_Y,
-        width: 28,
-        height: 40,
-        vx: 0,
-        vy: 0,
-        onGround: true,
-        paused: false,
-        lastBrainSampleX: 880,
-        lastBrainSampleY: DEFAULT_FLOOR_Y,
-        memorySummary: "Bravo starts near the right side of the room.",
-        lastObservation: "Booting simulation.",
-        recentEvents: ["Sensor suite online."],
-        thread: [],
-        traces: [],
+        objectiveRevision: 0,
       },
     },
     metrics: {
@@ -500,8 +447,15 @@ export const createInitialWorld = (): WorldState => {
     },
   };
 
+  for (let x = 0; x < world.gridWidth; x += 1) {
+    for (let y = 0; y < world.gridDepth; y += 1) {
+      setBlock(world, x, y, 0, "grass");
+    }
+  }
+
   for (const entityId of Object.keys(world.entities)) {
-    world.entities[entityId]!.lastViewportImageDataUrl = buildViewportImageDataUrl(world, entityId);
+    const observation = buildObservation(world, entityId);
+    world.entities[entityId]!.lastViewportImageDataUrl = observation.viewportImageDataUrl;
   }
 
   return world;
@@ -514,76 +468,11 @@ export const tickPhysics = (world: WorldState) => {
   const now = Date.now();
   next.metrics.totalPhysicsTicks += 1;
   next.metrics.physicsTickTimestamps = pruneSamples([...next.metrics.physicsTickTimestamps, now], now);
-  const roomLeft = ROOM_FRAME_INSET + ROOM_CONTENT_PADDING;
-  const roomRight = next.width - ROOM_FRAME_INSET - ROOM_CONTENT_PADDING;
-  const roomCeiling = ROOM_FRAME_INSET + ROOM_CONTENT_PADDING;
 
   for (const entity of Object.values(next.entities)) {
     if (entity.paused) {
       entity.status = "paused";
-      entity.vx = 0;
-      continue;
-    }
-
-    if (!entity.onGround || entity.intent?.kind === "jump") {
-      entity.vy += GRAVITY * 0.05;
-    }
-
-    let horizontalStep = 0;
-    if (entity.intent?.kind === "walk") {
-      const maxStep = WALK_SPEED * 0.05;
-      horizontalStep = Math.min(entity.intent.remaining, maxStep) * (entity.intent.direction === "right" ? 1 : -1);
-      entity.intent.remaining = Math.max(0, entity.intent.remaining - Math.abs(horizontalStep));
-      entity.status = "moving";
-    } else if (entity.intent?.kind === "jump") {
-      if (!entity.intent.launched && entity.onGround) {
-        entity.vy = -entity.intent.strength;
-        entity.onGround = false;
-        entity.intent.launched = true;
-        pushEvent(entity, `Jumped ${entity.intent.direction}.`);
-      }
-      const maxStep = AIR_SPEED * 0.05;
-      horizontalStep = Math.min(entity.intent.remaining, maxStep) * (entity.intent.direction === "right" ? 1 : -1);
-      entity.intent.remaining = Math.max(0, entity.intent.remaining - Math.abs(horizontalStep));
-      entity.status = "moving";
-    }
-
-    if (horizontalStep !== 0) {
-      const horizontal = resolveHorizontal(entity, horizontalStep, next.obstacles);
-      if (horizontal.blocked) {
-        delete entity.intent;
-        entity.status = "idle";
-        entity.lastActionResult = "Movement blocked by nearby geometry.";
-        pushEvent(entity, "Movement blocked by an obstacle.");
-      } else {
-        entity.x = clamp(horizontal.x, roomLeft + entity.width / 2, roomRight - entity.width / 2);
-      }
-    }
-
-    const vertical = resolveVertical(entity, entity.vy * 0.05, next.obstacles, next.floorY);
-    entity.y = Math.max(vertical.y, roomCeiling + entity.height);
-    if (vertical.onGround) {
-      entity.onGround = true;
-      entity.vy = 0;
-      if (entity.intent?.kind === "jump" && entity.intent.remaining <= 0) {
-        delete entity.intent;
-        entity.status = "idle";
-      }
-    } else {
-      entity.onGround = false;
-      if (vertical.hitCeiling) {
-        entity.vy = 0;
-      }
-    }
-
-    if (entity.intent?.kind === "walk" && entity.intent.remaining <= 0) {
-      delete entity.intent;
-      entity.status = "idle";
-    }
-
-    entity.x = clamp(entity.x, roomLeft + entity.width / 2, roomRight - entity.width / 2);
-
-    if (!entity.intent && entity.status !== "thinking") {
+    } else if (entity.status !== "thinking") {
       entity.status = "idle";
     }
   }
@@ -593,92 +482,70 @@ export const tickPhysics = (world: WorldState) => {
 
 export const buildObservation = (world: WorldState, entityId: string): ViewObservation => {
   const entity = getEntityOrThrow(world, entityId);
-  const selfCenterX = entity.x;
-  const selfCenterY = entity.y - entity.height / 2;
-  const progressDx = Math.round(entity.x - entity.lastBrainSampleX);
-  const progressDy = Math.round(entity.y - entity.lastBrainSampleY);
-  const viewportImageDataUrl = buildViewportImageDataUrl(world, entityId);
-
-  const visibleEntities = Object.values(world.entities)
-    .filter((candidate) => candidate.id !== entityId)
-    .map((candidate) => {
-      const targetCenterX = candidate.x;
-      const targetCenterY = candidate.y - candidate.height / 2;
-      const lineOfSight = !world.obstacles.some((obstacle) =>
-        lineIntersectsRect(selfCenterX, selfCenterY, targetCenterX, targetCenterY, obstacle),
-      );
-      return {
-        id: candidate.id,
-        name: candidate.name,
-        distance: Math.round(Math.abs(candidate.x - entity.x)),
-        direction: candidate.x >= entity.x ? "right" : "left",
-        lineOfSight,
-      } satisfies VisibleEntity;
-    })
-    .filter((candidate) => candidate.distance <= 900)
-    .sort((a, b) => a.distance - b.distance);
-
-  const obstacleHints = (["left", "right"] as const)
-    .map((direction) => findNearestObstacle(entity, direction, world.obstacles))
-    .filter((hint): hint is RayObstacleHint => Boolean(hint))
-    .filter((hint) => hint.distance <= 220);
-
-  const urgentHints: string[] = [];
-  const immediateObstacle = obstacleHints.find((hint) => hint.distance < 90);
-  if (immediateObstacle) {
-    urgentHints.push(
-      `${immediateObstacle.direction.toUpperCase()} obstacle ${immediateObstacle.distance}px away; ${
-        immediateObstacle.jumpRecommended ? "jump is viable" : "jump may not clear it"
-      }.`,
-    );
-  }
-
-  if (visibleEntities.length > 0) {
-    urgentHints.push(
-      `Visible entity ids: ${visibleEntities
-        .map((candidate) => `${candidate.id} (${candidate.direction}, ${candidate.distance}px, los=${candidate.lineOfSight})`)
-        .join("; ")}`,
-    );
-  } else {
-    urgentHints.push("No other entities are currently visible.");
-  }
-
-  const lastTrace = entity.traces[0];
-  const repeatedBlockedActionWarning =
-    lastTrace &&
-    entity.lastActionResult?.toLowerCase().includes("blocked") &&
-    Math.abs(progressDx) < 6 &&
-    Math.abs(progressDy) < 6
-      ? `Do not repeat ${lastTrace.actionName} with the same args; it made no progress. Choose a different action or inspect_view.`
-      : undefined;
-
+  const reachableCells = buildReachableCells(world, entity);
+  const builtCounts = countBuiltBlocks(world);
+  const inspectText = inspectPatchText(world, entity, reachableCells);
+  const beaconsText = formatBeaconObservation(world, entity);
+  const moveOptions = (["forward", "backward", "left", "right"] as const).map((direction) => simulateMoveStep(world, entity, direction)).join(" | ");
+  const buildableCells = sortCellsForBuild(
+    reachableCells.filter(
+      (cell) => cell.dz >= 1 && cell.current === "empty" && cell.supported && !isBuilderOccupiedLocalCell(cell),
+    ),
+  ).slice(0, 12);
+  const blockedPlaceCells = sortCellsForBuild(
+    reachableCells.filter((cell) => cell.dz >= 1 && cell.current !== "empty"),
+  ).slice(0, 8);
+  const removableCells = sortCellsForBuild(
+    reachableCells.filter((cell) => cell.current !== "empty" && cell.current !== "grass"),
+  ).slice(0, 8);
   const promptText = [
-    `urgent=${urgentHints.join(" | ")}`,
-    `self=x:${Math.round(entity.x)} y:${Math.round(entity.y)} ground:${entity.onGround} paused:${entity.paused}`,
-    `progress_since_last_turn=dx:${progressDx} dy:${progressDy}`,
-    `visible=${
-      visibleEntities.length > 0
-        ? visibleEntities
-            .map((candidate) => `${candidate.id}:${candidate.direction}:${candidate.distance}:los=${candidate.lineOfSight}`)
-            .join(", ")
-        : "none"
-    }`,
-    `obstacles=${
-      obstacleHints.length > 0
-        ? obstacleHints
-            .map(
-              (hint) =>
-                `${hint.direction}:${hint.distance}:h=${hint.height}:jump=${hint.jumpRecommended}`,
-            )
-            .join(", ")
-        : "none"
-    }`,
-    `last=${entity.lastActionResult ?? "none"}`,
-    `recent=${entity.recentEvents.slice(0, 2).join(" | ") || "none"}`,
-    ...(repeatedBlockedActionWarning ? [`repeat_warning=${repeatedBlockedActionWarning}`] : []),
+    `self=pos(${entity.gridX},${entity.gridY},${entity.gridZ}) facing=${entity.facing}`,
+    `built_counts=stone:${builtCounts.stone} wood:${builtCounts.wood} glass:${builtCounts.glass} total=${builtCounts.stone + builtCounts.wood + builtCounts.glass}`,
+    `beacons=${beaconsText || "none"}`,
+    `viewport_markers=${beaconsText || "none"}`,
+    `objective_hint=${buildObjectiveHint(entity.prompt)}`,
+    `buildable_cells=${formatCellList(buildableCells) || "none"}`,
+    `blocked_place_cells=${formatCellList(blockedPlaceCells, true) || "none"}`,
+    `removable_cells=${formatCellList(removableCells, true) || "none"}`,
+    `move_options=${moveOptions}`,
+    `last=${clipObservationText(entity.lastActionResult ?? "none", 140)}`,
+    `recent=${clipObservationText(entity.recentEvents.slice(0, 2).join(" | ") || "none", 120)}`,
   ].join("\n");
 
-  return { promptText, visibleEntities, obstacleHints, urgentHints, viewportImageDataUrl };
+  return {
+    promptText,
+    inspectText,
+    viewportImageDataUrl: renderViewportPngDataUrl({
+      gridWidth: world.gridWidth,
+      gridDepth: world.gridDepth,
+      gridHeight: world.gridHeight,
+      blocks: Object.entries(world.blocks).map(([key, type]) => {
+        const { x, y, z } = parseBlockKey(key);
+        return { x, y, z, type } satisfies BlockSnapshot;
+      }),
+      beacons: beaconList(world).map((beacon, index) => ({
+        x: beacon.x,
+        y: beacon.y,
+        label: beacon.label,
+        marker: index + 1,
+      })),
+      entity: {
+        x: entity.gridX,
+        y: entity.gridY,
+        z: entity.gridZ,
+        facing: entity.facing,
+        color: entity.color,
+      },
+    }),
+    self: {
+      x: entity.gridX,
+      y: entity.gridY,
+      z: entity.gridZ,
+      facing: entity.facing,
+    },
+    builtCounts,
+    reachableCells,
+  };
 };
 
 export const scheduleThinking = (world: WorldState, entityId: string, observation: ViewObservation) => {
@@ -690,34 +557,42 @@ export const scheduleThinking = (world: WorldState, entityId: string, observatio
   entity.status = "thinking";
   entity.lastObservation = observation.promptText;
   entity.lastViewportImageDataUrl = observation.viewportImageDataUrl;
-  entity.lastBrainSampleX = entity.x;
-  entity.lastBrainSampleY = entity.y;
   return next;
 };
 
-const inspectViewText = (observation: ViewObservation) =>
-  [
-    `Visible entities: ${
-      observation.visibleEntities.length > 0
-        ? observation.visibleEntities
-            .map(
-              (candidate) =>
-                `${candidate.id} (${candidate.name}) ${candidate.distance}px ${candidate.direction}, los=${candidate.lineOfSight}`,
-            )
-            .join("; ")
-        : "none"
-    }.`,
-    `Obstacle hints: ${
-      observation.obstacleHints.length > 0
-        ? observation.obstacleHints
-            .map(
-              (hint) =>
-                `${hint.direction} ${hint.distance}px, height=${hint.height}, jumpRecommended=${hint.jumpRecommended}`,
-            )
-            .join("; ")
-        : "none"
-    }.`,
-  ].join(" ");
+const tryMoveStep = (world: WorldState, entity: EntityState, direction: MoveDirection) => {
+  const delta = moveDeltaForDirection(entity.facing, direction);
+  const targetX = entity.gridX + delta.x;
+  const targetY = entity.gridY + delta.y;
+  if (!isInsideGrid(world, targetX, targetY, 0)) {
+    return `Move blocked: ${direction} would leave the build plate.`;
+  }
+
+  const targetStandZ = highestSolidZ(world, targetX, targetY) + 1;
+  if (targetStandZ < 1 || targetStandZ >= world.gridHeight) {
+    return `Move blocked: ${direction} has no valid standing surface.`;
+  }
+  if (Math.abs(targetStandZ - entity.gridZ) > 1) {
+    return `Move blocked: ${direction} is too steep from z${entity.gridZ} to z${targetStandZ}.`;
+  }
+
+  entity.gridX = targetX;
+  entity.gridY = targetY;
+  entity.gridZ = targetStandZ;
+  return `Moved ${direction} to (${entity.gridX},${entity.gridY},${entity.gridZ}).`;
+};
+
+const resolveTargetBlock = (world: WorldState, entity: EntityState, dx: number, dy: number, dz: number) => {
+  const baseSurfaceZ = entity.gridZ - 1;
+  const worldDelta = toWorldDelta(entity.facing, dx, dy);
+  const targetX = entity.gridX + worldDelta.x;
+  const targetY = entity.gridY + worldDelta.y;
+  const targetZ = baseSurfaceZ + dz;
+  if (!isInsideGrid(world, targetX, targetY, targetZ)) {
+    return undefined;
+  }
+  return { x: targetX, y: targetY, z: targetZ };
+};
 
 export const executeTool = (world: WorldState, entityId: string, invocation: ToolInvocation) => {
   const next = structuredClone(world);
@@ -726,82 +601,124 @@ export const executeTool = (world: WorldState, entityId: string, invocation: Too
     return { world: next, result: `Unknown entity: ${entityId}` };
   }
 
+  if (
+    invocation.name === "place_block" &&
+    sameToolCall(entity.lastToolCall, invocation) &&
+    entity.lastActionResult?.startsWith("Place blocked:")
+  ) {
+    const result = "Place blocked: repeated identical placement suppressed. Inspect or choose a different local cell.";
+    entity.lastActionResult = result;
+    pushEvent(entity, result);
+    return { world: next, result };
+  }
+
   entity.lastToolCall = { name: invocation.name, args: invocation.args };
 
   switch (invocation.name) {
-    case "inspect_view": {
+    case "inspect_patch": {
       const observation = buildObservation(next, entityId);
-      const result = inspectViewText(observation);
-      entity.lastActionResult = result;
-      pushEvent(entity, "Inspected the visible room state.");
-      return { world: next, result };
+      entity.lastActionResult = observation.inspectText;
+      entity.lastViewportImageDataUrl = observation.viewportImageDataUrl;
+      pushEvent(entity, "Inspected the local build patch.");
+      return { world: next, result: observation.inspectText };
+    }
+
+    case "turn": {
+      entity.facing = turnFacing(entity.facing, invocation.args.direction);
+      entity.status = "moving";
+      entity.lastActionResult = `Turned ${invocation.args.direction}; now facing ${entity.facing}.`;
+      pushEvent(entity, entity.lastActionResult);
+      return { world: next, result: entity.lastActionResult };
     }
 
     case "move": {
-      const distance = clamp(Math.round(invocation.args.distance), 20, 240);
-      entity.intent = {
-        kind: "walk",
-        direction: invocation.args.direction,
-        remaining: distance,
-      };
+      const steps = Math.max(1, Math.min(2, Math.round(invocation.args.steps)));
+      let result = `Move ${invocation.args.direction} failed.`;
+      for (let step = 0; step < steps; step += 1) {
+        result = tryMoveStep(next, entity, invocation.args.direction);
+        if (result.startsWith("Move blocked")) {
+          break;
+        }
+      }
       entity.status = "moving";
-      entity.lastActionResult = `Scheduled walk ${invocation.args.direction} for ${distance}px.`;
+      entity.lastActionResult = result;
+      pushEvent(entity, result);
+      return { world: next, result };
+    }
+
+    case "place_block": {
+      const target = resolveTargetBlock(
+        next,
+        entity,
+        Math.max(-1, Math.min(1, Math.round(invocation.args.dx))),
+        Math.max(0, Math.min(3, Math.round(invocation.args.dy))),
+        Math.max(1, Math.min(3, Math.round(invocation.args.dz))),
+      );
+      if (!target) {
+        const result = "Place blocked: target is outside the build plate.";
+        entity.lastActionResult = result;
+        pushEvent(entity, result);
+        return { world: next, result };
+      }
+      if (getBlock(next, target.x, target.y, target.z)) {
+        const result = `Place blocked: (${target.x},${target.y},${target.z}) is already occupied.`;
+        entity.lastActionResult = result;
+        pushEvent(entity, result);
+        return { world: next, result };
+      }
+      if (target.x === entity.gridX && target.y === entity.gridY && target.z === entity.gridZ) {
+        const result = "Place blocked: cannot place a block inside the builder.";
+        entity.lastActionResult = result;
+        pushEvent(entity, result);
+        return { world: next, result };
+      }
+      if (target.z > 0 && !getBlock(next, target.x, target.y, target.z - 1)) {
+        const result = `Place blocked: (${target.x},${target.y},${target.z}) has no support below.`;
+        entity.lastActionResult = result;
+        pushEvent(entity, result);
+        return { world: next, result };
+      }
+
+      setBlock(next, target.x, target.y, target.z, invocation.args.blockType);
+      entity.status = "moving";
+      entity.lastActionResult = `Placed ${invocation.args.blockType} at (${target.x},${target.y},${target.z}).`;
       pushEvent(entity, entity.lastActionResult);
       return { world: next, result: entity.lastActionResult };
     }
 
-    case "jump": {
-      if (!entity.onGround) {
-        const result = "Jump ignored: entity is airborne.";
+    case "remove_block": {
+      const target = resolveTargetBlock(
+        next,
+        entity,
+        Math.max(-1, Math.min(1, Math.round(invocation.args.dx))),
+        Math.max(0, Math.min(3, Math.round(invocation.args.dy))),
+        Math.max(0, Math.min(3, Math.round(invocation.args.dz))),
+      );
+      if (!target) {
+        const result = "Remove blocked: target is outside the build plate.";
         entity.lastActionResult = result;
         pushEvent(entity, result);
         return { world: next, result };
       }
-      const distance = clamp(Math.round(invocation.args.distance), 40, 220);
-      const strength = clamp(Math.round(invocation.args.strength), 260, 420);
-      entity.intent = {
-        kind: "jump",
-        direction: invocation.args.direction,
-        remaining: distance,
-        strength,
-        launched: false,
-      };
+      const blockType = getBlock(next, target.x, target.y, target.z);
+      if (!blockType || blockType === "grass") {
+        const result = `Remove blocked: (${target.x},${target.y},${target.z}) has no removable block.`;
+        entity.lastActionResult = result;
+        pushEvent(entity, result);
+        return { world: next, result };
+      }
+      if (target.x === entity.gridX && target.y === entity.gridY && target.z === entity.gridZ - 1) {
+        const result = "Remove blocked: cannot remove the support block beneath the builder.";
+        entity.lastActionResult = result;
+        pushEvent(entity, result);
+        return { world: next, result };
+      }
+
+      removeBlock(next, target.x, target.y, target.z);
       entity.status = "moving";
-      entity.lastActionResult = `Scheduled jump ${invocation.args.direction} for ${distance}px at strength ${strength}.`;
+      entity.lastActionResult = `Removed ${blockType} at (${target.x},${target.y},${target.z}).`;
       pushEvent(entity, entity.lastActionResult);
-      return { world: next, result: entity.lastActionResult };
-    }
-
-    case "approach_entity": {
-      const target = next.entities[invocation.args.entityId];
-      if (!target || target.id === entityId) {
-        const result = `Approach ignored: target ${invocation.args.entityId} is invalid.`;
-        entity.lastActionResult = result;
-        pushEvent(entity, result);
-        return { world: next, result };
-      }
-
-      const stopWithin = clamp(Math.round(invocation.args.stopWithin), 28, 140);
-      const distanceToTarget = Math.round(Math.abs(target.x - entity.x));
-      const remaining = Math.max(0, distanceToTarget - stopWithin);
-      const direction: Direction = target.x >= entity.x ? "right" : "left";
-      entity.targetEntityId = target.id;
-
-      if (remaining === 0) {
-        const result = `Already within ${stopWithin}px of ${target.id}.`;
-        entity.lastActionResult = result;
-        pushEvent(entity, result);
-        return { world: next, result };
-      }
-
-      entity.intent = {
-        kind: "walk",
-        direction,
-        remaining: clamp(remaining, 20, 260),
-      };
-      entity.status = "moving";
-      entity.lastActionResult = `Approaching ${target.id} from the ${direction} within ${stopWithin}px.`;
-      pushEvent(entity, entity.lastActionResult);
+      entity.gridZ = highestSolidZ(next, entity.gridX, entity.gridY) + 1;
       return { world: next, result: entity.lastActionResult };
     }
   }
@@ -814,16 +731,16 @@ export const applyBrainResult = (world: WorldState, entityId: string, result: Br
     return next;
   }
 
+  if (result.objectiveRevision !== entity.objectiveRevision) {
+    return next;
+  }
+
   const now = Date.now();
   next.metrics.totalBrainTurns += 1;
   next.metrics.brainTurnTimestamps = pruneSamples([...next.metrics.brainTurnTimestamps, now], now);
   next.metrics.brainLatenciesMs = limitSample([...next.metrics.brainLatenciesMs, result.latencyMs]);
-
   if (result.completionTokensPerSecond !== undefined) {
-    next.metrics.completionTokenRates = limitSample([
-      ...next.metrics.completionTokenRates,
-      result.completionTokensPerSecond,
-    ]);
+    next.metrics.completionTokenRates = limitSample([...next.metrics.completionTokenRates, result.completionTokensPerSecond]);
   }
 
   entity.visibleThought = clipThought(result.thought);
@@ -835,7 +752,7 @@ export const applyBrainResult = (world: WorldState, entityId: string, result: Br
   if (result.toolResult !== undefined) {
     entity.lastActionResult = result.toolResult;
   }
-  entity.status = entity.paused ? "paused" : entity.intent ? "moving" : "idle";
+  entity.status = entity.paused ? "paused" : "idle";
   appendThreadEntries(entity, result.threadEntries);
   pushTrace(entity, {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -850,9 +767,7 @@ export const applyBrainResult = (world: WorldState, entityId: string, result: Br
     ...(result.viewportImageDataUrl ? { viewportImageDataUrl: result.viewportImageDataUrl } : {}),
     latencyMs: result.latencyMs,
     ...(result.completionTokens !== undefined ? { completionTokens: result.completionTokens } : {}),
-    ...(result.completionTokensPerSecond !== undefined
-      ? { completionTokensPerSecond: result.completionTokensPerSecond }
-      : {}),
+    ...(result.completionTokensPerSecond !== undefined ? { completionTokensPerSecond: result.completionTokensPerSecond } : {}),
   });
   return next;
 };
@@ -882,8 +797,17 @@ export const patchEntity = (
   }
 
   if (patch.prompt !== undefined) {
-    entity.prompt = patch.prompt.trim() || entity.prompt;
-    pushEvent(entity, "Prompt updated from debug UI.");
+    const nextPrompt = patch.prompt.trim();
+    if (nextPrompt !== entity.prompt) {
+      entity.prompt = nextPrompt;
+      entity.objectiveRevision += 1;
+      entity.thread = [];
+      entity.memorySummary = "Operator objective changed. Start from the new objective and current observation only.";
+      entity.lastActionResult = "Objective updated from UI. Previous short-term thread cleared.";
+      entity.status = entity.paused ? "paused" : "idle";
+      entity.visibleThought = nextPrompt.length > 0 ? entity.visibleThought : "Awaiting an objective.";
+      pushEvent(entity, "Objective updated from UI.");
+    }
   }
 
   if (patch.paused !== undefined) {
@@ -895,9 +819,44 @@ export const patchEntity = (
   if (patch.resetThread) {
     entity.thread = [];
     entity.memorySummary = "Thread reset from debug UI. No compressed history retained.";
+    entity.lastActionResult = "Thread reset from UI. Awaiting the next objective step.";
     pushEvent(entity, "Thread reset from debug UI.");
   }
 
+  return { world: next, updated: true };
+};
+
+export const upsertBeacon = (world: WorldState, input: { x: number; y: number; label: string }) => {
+  const next = structuredClone(world);
+  const x = Math.max(0, Math.min(next.gridWidth - 1, Math.round(input.x)));
+  const y = Math.max(0, Math.min(next.gridDepth - 1, Math.round(input.y)));
+  const label = input.label.trim().slice(0, 32);
+
+  const existing = Object.values(next.beacons).find((beacon) => beacon.x === x && beacon.y === y);
+  if (label.length === 0) {
+    if (existing) {
+      delete next.beacons[existing.id];
+    }
+    return { world: next, updated: true };
+  }
+
+  const normalized = label.replace(/\s+/g, " ");
+  const beaconId = existing?.id ?? `beacon-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  next.beacons[beaconId] = {
+    id: beaconId,
+    x,
+    y,
+    label: normalized,
+  };
+  return { world: next, updated: true };
+};
+
+export const removeBeacon = (world: WorldState, beaconId: string) => {
+  const next = structuredClone(world);
+  if (!next.beacons[beaconId]) {
+    return { world: next, updated: false };
+  }
+  delete next.beacons[beaconId];
   return { world: next, updated: true };
 };
 
@@ -906,20 +865,11 @@ export const worldSnapshot = (world: WorldState, llm: LlmStatus): WorldSnapshot 
   const brainTurnsPerSecond = Number((world.metrics.brainTurnTimestamps.length / (PHYSICS_WINDOW_MS / 1000)).toFixed(2));
   const averageBrainLatencyMs =
     world.metrics.brainLatenciesMs.length > 0
-      ? Number(
-          (
-            world.metrics.brainLatenciesMs.reduce((sum, value) => sum + value, 0) / world.metrics.brainLatenciesMs.length
-          ).toFixed(1),
-        )
+      ? Number((world.metrics.brainLatenciesMs.reduce((sum, value) => sum + value, 0) / world.metrics.brainLatenciesMs.length).toFixed(1))
       : 0;
   const averageCompletionTokensPerSecond =
     world.metrics.completionTokenRates.length > 0
-      ? Number(
-          (
-            world.metrics.completionTokenRates.reduce((sum, value) => sum + value, 0) /
-            world.metrics.completionTokenRates.length
-          ).toFixed(2),
-        )
+      ? Number((world.metrics.completionTokenRates.reduce((sum, value) => sum + value, 0) / world.metrics.completionTokenRates.length).toFixed(2))
       : 0;
 
   const entities: EntitySnapshot[] = Object.values(world.entities).map((entity) => ({
@@ -929,11 +879,10 @@ export const worldSnapshot = (world: WorldState, llm: LlmStatus): WorldSnapshot 
     prompt: entity.prompt,
     visibleThought: entity.visibleThought,
     status: entity.status,
-    x: entity.x,
-    y: entity.y,
-    width: entity.width,
-    height: entity.height,
-    onGround: entity.onGround,
+    gridX: entity.gridX,
+    gridY: entity.gridY,
+    gridZ: entity.gridZ,
+    facing: entity.facing,
     paused: entity.paused,
     memorySummary: entity.memorySummary,
     lastObservation: entity.lastObservation,
@@ -943,15 +892,27 @@ export const worldSnapshot = (world: WorldState, llm: LlmStatus): WorldSnapshot 
     ...(entity.lastToolCall ? { lastToolCall: entity.lastToolCall } : {}),
     ...(entity.lastActionResult ? { lastActionResult: entity.lastActionResult } : {}),
     ...(entity.lastViewportImageDataUrl ? { lastViewportImageDataUrl: entity.lastViewportImageDataUrl } : {}),
-    ...(entity.targetEntityId ? { targetEntityId: entity.targetEntityId } : {}),
+  }));
+
+  const blocks: BlockSnapshot[] = Object.entries(world.blocks).map(([key, type]) => {
+    const { x, y, z } = parseBlockKey(key);
+    return { x, y, z, type };
+  });
+
+  const beacons: BeaconSnapshot[] = beaconList(world).map((beacon) => ({
+    id: beacon.id,
+    x: beacon.x,
+    y: beacon.y,
+    label: beacon.label,
   }));
 
   return {
     generatedAt: Date.now(),
-    width: world.width,
-    height: world.height,
-    floorY: world.floorY,
-    obstacles: world.obstacles,
+    gridWidth: world.gridWidth,
+    gridDepth: world.gridDepth,
+    gridHeight: world.gridHeight,
+    blocks,
+    beacons,
     entities,
     llm,
     metrics: {

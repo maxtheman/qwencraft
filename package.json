@@ -11,7 +11,9 @@
     "dev:client": "vite",
     "dev:server": "tsx watch src/server/main.ts",
     "build": "tsc --noEmit && vite build",
+    "test": "tsx --test src/**/*.test.ts",
     "profile:lmstudio": "tsx src/server/profile.ts",
+    "harness:headless": "tsx src/server/headless.ts",
     "start": "tsx src/server/main.ts"
   },
   "keywords": [],

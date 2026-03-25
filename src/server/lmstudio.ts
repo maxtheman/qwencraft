@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { Schema } from "effect";
-import type { RuntimeMode } from "../shared/contracts";
-import type { BrainResult, ThreadMessage, ToolInvocation, ViewObservation, VisibleEntity } from "./runtime";
+import type { Facing, MoveDirection, RuntimeMode, TurnDirection } from "../shared/contracts";
+import type { BrainResult, ThreadMessage, ToolInvocation, ViewObservation } from "./runtime";
 
 type BrainInput = {
   entity: {
@@ -9,6 +9,7 @@ type BrainInput = {
     name: string;
     prompt: string;
     memorySummary: string;
+    objectiveRevision: number;
   };
   observation: ViewObservation;
   thread: ThreadMessage[];
@@ -27,7 +28,21 @@ type LlmConfig = {
   baseUrl: string;
   model?: string;
   apiKey: string;
+  toolMode?: "auto" | "native" | "json";
+  imageMode?: "auto" | "always" | "never";
+  temperature?: number;
+  maxTokens?: number;
+  topP?: number;
 };
+
+type BuildBlockType = "stone" | "wood" | "glass";
+
+type PromptOverride = {
+  thought?: string;
+  toolCall?: ToolInvocation;
+};
+
+type NativeToolName = ToolInvocation["name"] | "wait";
 
 const withOptionalString = <Key extends string>(key: Key, value: string | undefined) =>
   value !== undefined ? ({ [key]: value } as Record<Key, string>) : {};
@@ -35,31 +50,58 @@ const withOptionalString = <Key extends string>(key: Key, value: string | undefi
 const withOptionalNumber = <Key extends string>(key: Key, value: number | undefined) =>
   value !== undefined ? ({ [key]: value } as Record<Key, number>) : {};
 
-const MoveArgs = Schema.Struct({
-  direction: Schema.Literal("left", "right"),
-  distance: Schema.Number,
-});
+const MoveDirectionSchema = Schema.Literal("forward", "backward", "left", "right");
+const TurnDirectionSchema = Schema.Literal("left", "right");
+const BuildBlockTypeSchema = Schema.Literal("stone", "wood", "glass");
 
-const JumpArgs = Schema.Struct({
-  direction: Schema.Literal("left", "right"),
-  distance: Schema.Number,
-  strength: Schema.Number,
-});
-
-const ApproachArgs = Schema.Struct({
-  entityId: Schema.String,
-  stopWithin: Schema.Number,
-});
-
-const StructuredActionSchema = Schema.Struct({
-  type: Schema.Literal("wait", "inspect_view", "move", "jump", "approach_entity"),
-  direction: Schema.optional(Schema.Literal("left", "right")),
-  distance: Schema.optional(Schema.Number),
-  strength: Schema.optional(Schema.Number),
-  entityId: Schema.optional(Schema.String),
-  stopWithin: Schema.optional(Schema.Number),
+const WaitActionSchema = Schema.Struct({
+  type: Schema.Literal("wait"),
   reason: Schema.optional(Schema.String),
 });
+
+const InspectPatchActionSchema = Schema.Struct({
+  type: Schema.Literal("inspect_patch"),
+  reason: Schema.optional(Schema.String),
+});
+
+const MoveActionSchema = Schema.Struct({
+  type: Schema.Literal("move"),
+  direction: MoveDirectionSchema,
+  steps: Schema.Number,
+  reason: Schema.optional(Schema.String),
+});
+
+const TurnActionSchema = Schema.Struct({
+  type: Schema.Literal("turn"),
+  direction: TurnDirectionSchema,
+  reason: Schema.optional(Schema.String),
+});
+
+const PlaceBlockActionSchema = Schema.Struct({
+  type: Schema.Literal("place_block"),
+  blockType: BuildBlockTypeSchema,
+  dx: Schema.Number,
+  dy: Schema.Number,
+  dz: Schema.Number,
+  reason: Schema.optional(Schema.String),
+});
+
+const RemoveBlockActionSchema = Schema.Struct({
+  type: Schema.Literal("remove_block"),
+  dx: Schema.Number,
+  dy: Schema.Number,
+  dz: Schema.Number,
+  reason: Schema.optional(Schema.String),
+});
+
+const StructuredActionSchema = Schema.Union(
+  WaitActionSchema,
+  InspectPatchActionSchema,
+  MoveActionSchema,
+  TurnActionSchema,
+  PlaceBlockActionSchema,
+  RemoveBlockActionSchema,
+);
 
 const StructuredDecisionSchema = Schema.Struct({
   thought: Schema.String,
@@ -68,41 +110,83 @@ const StructuredDecisionSchema = Schema.Struct({
 
 type StructuredAction = typeof StructuredActionSchema.Type;
 type StructuredDecision = typeof StructuredDecisionSchema.Type;
-type PromptOverride = {
-  thought?: string;
-  toolCall?: ToolInvocation;
-};
-type ParsedPromptDirective = {
-  thought?: string;
-  toolCall?: ToolInvocation;
-  hasActionDirective: boolean;
-};
 
 const structuredDecisionFormat = {
   type: "json_schema",
   json_schema: {
-    name: "brain_turn",
+    name: "builder_turn",
     strict: true,
     schema: {
       type: "object",
       properties: {
         thought: { type: "string" },
         action: {
-          type: "object",
-          properties: {
-            type: {
-              type: "string",
-              enum: ["wait", "inspect_view", "move", "jump", "approach_entity"],
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "wait" },
+                reason: { type: "string" },
+              },
+              required: ["type"],
+              additionalProperties: false,
             },
-            direction: { type: "string", enum: ["left", "right"] },
-            distance: { type: "number" },
-            strength: { type: "number" },
-            entityId: { type: "string" },
-            stopWithin: { type: "number" },
-            reason: { type: "string" },
-          },
-          required: ["type"],
-          additionalProperties: false,
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "inspect_patch" },
+                reason: { type: "string" },
+              },
+              required: ["type"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "move" },
+                direction: { type: "string", enum: ["forward", "backward", "left", "right"] },
+                steps: { type: "number" },
+                reason: { type: "string" },
+              },
+              required: ["type", "direction", "steps"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "turn" },
+                direction: { type: "string", enum: ["left", "right"] },
+                reason: { type: "string" },
+              },
+              required: ["type", "direction"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "place_block" },
+                blockType: { type: "string", enum: ["stone", "wood", "glass"] },
+                dx: { type: "number" },
+                dy: { type: "number" },
+                dz: { type: "number" },
+                reason: { type: "string" },
+              },
+              required: ["type", "blockType", "dx", "dy", "dz"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", const: "remove_block" },
+                dx: { type: "number" },
+                dy: { type: "number" },
+                dz: { type: "number" },
+                reason: { type: "string" },
+              },
+              required: ["type", "dx", "dy", "dz"],
+              additionalProperties: false,
+            },
+          ],
         },
       },
       required: ["thought", "action"],
@@ -118,35 +202,109 @@ const structuredDecisionFormat = {
   };
 };
 
-const readContent = (content: OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam["content"] | null | undefined) => {
-  if (typeof content === "string") {
-    return content;
-  }
-
-  if (Array.isArray(content)) {
-    return content
-      .map((item) => ("text" in item ? item.text : ""))
-      .join(" ")
-      .trim();
-  }
-
-  return "";
-};
+const nativeTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "wait",
+      description: "Hold position when no action should be taken this turn.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "inspect_patch",
+      description: "Inspect the local build patch when the state is unclear or a previous action failed.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "move",
+      description: "Move one or two steps in local space.",
+      parameters: {
+        type: "object",
+        properties: {
+          direction: { type: "string", enum: ["forward", "backward", "left", "right"] },
+          steps: { type: "number" },
+        },
+        required: ["direction", "steps"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "turn",
+      description: "Turn in place to face left or right relative to the current facing.",
+      parameters: {
+        type: "object",
+        properties: {
+          direction: { type: "string", enum: ["left", "right"] },
+        },
+        required: ["direction"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "place_block",
+      description: "Place a supported block in a reachable local cell.",
+      parameters: {
+        type: "object",
+        properties: {
+          blockType: { type: "string", enum: ["stone", "wood", "glass"] },
+          dx: { type: "number" },
+          dy: { type: "number" },
+          dz: { type: "number" },
+        },
+        required: ["blockType", "dx", "dy", "dz"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "remove_block",
+      description: "Remove an existing non-grass block from a reachable local cell.",
+      parameters: {
+        type: "object",
+        properties: {
+          dx: { type: "number" },
+          dy: { type: "number" },
+          dz: { type: "number" },
+        },
+        required: ["dx", "dy", "dz"],
+        additionalProperties: false,
+      },
+    },
+  },
+];
 
 const clipThought = (text: string) => {
   const compact = text.replace(/\s+/g, " ").trim();
   if (compact.length <= 88) {
-    return compact || "Holding position.";
+    return compact || "Working the build plan.";
   }
   return `${compact.slice(0, 85).trimEnd()}...`;
-};
-
-const normalizePublicThought = (candidate: string, fallback: string) => {
-  const compact = candidate.replace(/\s+/g, " ").trim();
-  if (!compact || compact.startsWith("TOOL_CALL") || compact.startsWith("{") || compact.includes("\"direction\"")) {
-    return clipThought(fallback);
-  }
-  return clipThought(compact);
 };
 
 const clipText = (text: string, limit: number) => {
@@ -157,192 +315,140 @@ const clipText = (text: string, limit: number) => {
   return `${compact.slice(0, Math.max(0, limit - 3)).trimEnd()}...`;
 };
 
-const toChatHistoryRole = (role: ThreadMessage["role"]): "user" | "assistant" => (role === "assistant" ? "assistant" : "user");
-
-const buildHistoryMessages = (thread: ThreadMessage[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] =>
-  thread.map((message) => ({
-    role: toChatHistoryRole(message.role),
-    content: clipText(message.content, 420),
-  }));
-
-const buildObservationHistoryEntry = (observation: ViewObservation): ThreadMessage => ({
-  role: "user",
-  content: clipText(`Observation:\n${observation.promptText}\nViewport image attached.`, 520),
-});
-
-const renderRequestTranscript = (messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]) =>
-  messages
-    .map((message) => {
-      const content =
-        typeof message.content === "string"
-          ? message.content
-          : (message.content ?? [])
-              .map((part) => {
-                if (part.type === "text") {
-                  return part.text;
-                }
-                if (part.type === "image_url") {
-                  return `[image attached detail=${part.image_url.detail ?? "auto"}]`;
-                }
-                return `[${part.type}]`;
-              })
-              .join("\n");
-      return `[${message.role}]\n${content}`;
-    })
-    .join("\n\n");
-
-const readPromptThoughtDirective = (prompt: string) => {
-  const explicitMatch = prompt.match(/thought(?:\s*[:=]|\s+is\s+)\s*"([^"]{1,90})"/i);
-  if (explicitMatch?.[1]) {
-    return clipThought(explicitMatch[1]);
+const normalizeReasoningTrace = (text: string) => {
+  const compact = text
+    .replace(/<think>/gi, " ")
+    .replace(/<\/think>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!compact) {
+    return "";
   }
-
-  if (/scream/i.test(prompt)) {
-    return "SCREAM";
-  }
-
-  return undefined;
+  return clipThought(compact);
 };
 
-const readPromptActionDirective = (prompt: string): ToolInvocation | undefined => {
-  const normalized = prompt.toLowerCase();
-  const actionType = prompt.match(/action\.type\s*=\s*["']?([a-z_]+)["']?/i)?.[1]?.toLowerCase();
-  const direction = prompt.match(/direction\s*=\s*["']?(left|right)["']?/i)?.[1]?.toLowerCase() as
-    | "left"
-    | "right"
-    | undefined;
-  const distance = Number(prompt.match(/distance\s*=\s*(\d+)/i)?.[1] ?? Number.NaN);
-  const strength = Number(prompt.match(/strength\s*=\s*(\d+)/i)?.[1] ?? Number.NaN);
-  const entityId = prompt.match(/entityid\s*=\s*["']?([a-z0-9_-]+)["']?/i)?.[1];
-  const stopWithin = Number(prompt.match(/stopwithin\s*=\s*(\d+)/i)?.[1] ?? Number.NaN);
+const normalizePublicThought = (candidate: string, fallback: string) => {
+  const compact = candidate.replace(/\s+/g, " ").trim();
+  if (!compact || compact.startsWith("{") || compact.startsWith("TOOL_CALL") || compact.includes("\"type\"")) {
+    return clipThought(fallback);
+  }
+  return clipThought(compact);
+};
 
-  if (actionType === "wait" || /always wait|hold position|stay still|do not move/.test(normalized)) {
+const readReasoningContent = (message: OpenAI.Chat.Completions.ChatCompletionMessage) =>
+  normalizeReasoningTrace((message as { reasoning_content?: string }).reasoning_content?.trim() ?? "");
+
+const readAssistantTextContent = (message: OpenAI.Chat.Completions.ChatCompletionMessage) => {
+  const content = message.content;
+  if (typeof content === "string") {
+    const trimmed = content.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+
+  if (Array.isArray(content)) {
+    const text = content
+      .map((item) => ("text" in item ? item.text : ""))
+      .join(" ")
+      .trim();
+    if (text) {
+      return text;
+    }
+  }
+
+  return "";
+};
+
+const readContent = (message: OpenAI.Chat.Completions.ChatCompletionMessage) => {
+  const textContent = readAssistantTextContent(message);
+  if (textContent) {
+    return textContent;
+  }
+  return readReasoningContent(message);
+};
+
+const buildMemoryMessage = (memorySummary: string) => {
+  const compact = clipText(memorySummary, 140);
+  if (!compact || compact === "No summary yet.") {
     return undefined;
   }
-
-  if (actionType === "inspect_view") {
-    return { name: "inspect_view", args: {} };
-  }
-
-  if (actionType === "move" && direction) {
-    return {
-      name: "move",
-      args: {
-        direction,
-        distance: Number.isFinite(distance) ? distance : 80,
-      },
-    };
-  }
-
-  if (actionType === "jump" && direction) {
-    return {
-      name: "jump",
-      args: {
-        direction,
-        distance: Number.isFinite(distance) ? distance : 120,
-        strength: Number.isFinite(strength) ? strength : 320,
-      },
-    };
-  }
-
-  if (actionType === "approach_entity" && entityId) {
-    return {
-      name: "approach_entity",
-      args: {
-        entityId,
-        stopWithin: Number.isFinite(stopWithin) ? stopWithin : 72,
-      },
-    };
-  }
-
-  return undefined;
+  return `Working memory: ${compact}`;
 };
 
-const readPromptDirective = (prompt: string): ParsedPromptDirective | undefined => {
-  const thought = readPromptThoughtDirective(prompt);
-  const hasActionDirective =
-    /action\.type\s*=/.test(prompt) || /always wait|hold position|stay still|do not move/i.test(prompt);
-  const toolCall = hasActionDirective ? readPromptActionDirective(prompt) : undefined;
+const buildRecentTurnsText = (thread: ThreadMessage[]) =>
+  thread
+    .filter((message) => message.role === "assistant")
+    .slice(-2)
+    .map((message, index) => `${index + 1}. ${clipText(message.content, 180)}`)
+    .join("\n");
 
-  if (thought === undefined && !hasActionDirective) {
-    return undefined;
-  }
+const buildTurnSections = ({
+  objective,
+  memorySummary,
+  thread,
+  observationText,
+}: {
+  objective: string;
+  memorySummary: string;
+  thread: ThreadMessage[];
+  observationText: string;
+}) => {
+  const recentTurns = buildRecentTurnsText(thread);
+  const memoryText = buildMemoryMessage(memorySummary);
 
-  return {
-    ...(thought !== undefined ? { thought } : {}),
-    ...(toolCall !== undefined ? { toolCall } : {}),
-    hasActionDirective,
-  };
+  return [
+    `[objective]\n${objective}`,
+    ...(memoryText ? [`[memory]\n${memoryText}`] : []),
+    ...(recentTurns ? [`[recent_turns]\n${recentTurns}`] : []),
+    `[observation]\n${observationText}`,
+  ];
 };
 
-const readPromptOverride = (prompt: string): PromptOverride | undefined => {
-  const overridePrefix = prompt.match(/^\s*(?:@override|override:)\s*/i);
-  if (!overridePrefix) {
-    return undefined;
-  }
-
-  const directiveBody = prompt.slice(overridePrefix[0].length);
-  const parsed = readPromptDirective(directiveBody);
-  if (!parsed) {
-    return undefined;
-  }
-
-  return {
-    ...(parsed.thought !== undefined ? { thought: parsed.thought } : {}),
-    ...(parsed.toolCall !== undefined ? { toolCall: parsed.toolCall } : {}),
-  };
+const renderTurnContext = ({
+  objective,
+  memorySummary,
+  thread,
+  observationText,
+  withImage,
+}: {
+  objective: string;
+  memorySummary: string;
+  thread: ThreadMessage[];
+  observationText: string;
+  withImage: boolean;
+}) => {
+  return [
+    ...buildTurnSections({
+      objective,
+      memorySummary,
+      thread,
+      observationText,
+    }),
+    `[viewport]\n${withImage ? "attached (low detail)" : "text-only"}`,
+  ].join("\n\n");
 };
 
-const readStubPromptDirective = (prompt: string, observation: ViewObservation): ToolInvocation | undefined => {
-  const normalized = prompt.toLowerCase();
+const isImageProcessingError = (error: unknown) =>
+  (error instanceof Error ? error.message : String(error)).toLowerCase().includes("failed to process image");
 
-  if (/inspect|scan|look around/.test(normalized)) {
-    return { name: "inspect_view", args: {} };
-  }
-
-  if (/wait|hold position|stay still|do nothing/.test(normalized)) {
-    return undefined;
-  }
-
-  if (/approach bravo/.test(normalized) && observation.visibleEntities.some((candidate) => candidate.id === "bravo")) {
-    return { name: "approach_entity", args: { entityId: "bravo", stopWithin: 64 } };
-  }
-
-  if (/approach alpha/.test(normalized) && observation.visibleEntities.some((candidate) => candidate.id === "alpha")) {
-    return { name: "approach_entity", args: { entityId: "alpha", stopWithin: 64 } };
-  }
-
-  if (/move left|go left|only left/.test(normalized)) {
-    return { name: "move", args: { direction: "left", distance: 80 } };
-  }
-
-  if (/move right|go right|only right/.test(normalized)) {
-    return { name: "move", args: { direction: "right", distance: 80 } };
-  }
-
-  return undefined;
+const isToolCallingError = (error: unknown) => {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return message.includes("tool") || message.includes("function call") || message.includes("tool_choice");
 };
 
-const decodeTool = (name: string, rawArguments: string): ToolInvocation => {
-  const parsed = rawArguments.trim() ? JSON.parse(rawArguments) : {};
-  switch (name) {
-    case "inspect_view":
-      return { name: "inspect_view", args: {} };
-    case "move":
-      return { name: "move", args: Schema.decodeUnknownSync(MoveArgs)(parsed) };
-    case "jump":
-      return { name: "jump", args: Schema.decodeUnknownSync(JumpArgs)(parsed) };
-    case "approach_entity":
-      return { name: "approach_entity", args: Schema.decodeUnknownSync(ApproachArgs)(parsed) };
-    default:
-      throw new Error(`Unsupported tool: ${name}`);
+const shouldAttachViewport = (input: BrainInput, imageMode: NonNullable<LlmConfig["imageMode"]>) => {
+  if (imageMode === "always") {
+    return true;
   }
+  if (imageMode === "never") {
+    return false;
+  }
+
+  return input.observation.viewportImageDataUrl.length > 0;
 };
 
-const decodeStructuredDecision = (rawResponse: string): StructuredDecision => {
-  const parsed = JSON.parse(rawResponse) as unknown;
-  return Schema.decodeUnknownSync(StructuredDecisionSchema)(parsed);
-};
+const shouldAppendThinkDirective = (model: string) => model.toLowerCase().includes("qwen");
 
 const summarizeTurn = (thought: string, toolCall?: ToolInvocation, toolResult?: string) =>
   [
@@ -352,115 +458,464 @@ const summarizeTurn = (thought: string, toolCall?: ToolInvocation, toolResult?: 
     ...(toolResult ? [`result=${toolResult}`] : []),
   ]
     .join(" | ")
-    .slice(0, 220);
-
-const chooseTarget = (visibleEntities: VisibleEntity[]) =>
-  visibleEntities.find((candidate) => candidate.lineOfSight) ?? visibleEntities[0];
+    .slice(0, 260);
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const clampInt = (value: number | undefined, min: number, max: number, fallback: number) =>
+  clamp(Math.round(value ?? fallback), min, max);
 
-const findTargetById = (visibleEntities: VisibleEntity[], entityId: string | undefined) =>
-  entityId ? visibleEntities.find((candidate) => candidate.id === entityId) : undefined;
-
-const inferDirection = (action: StructuredAction, observation: ViewObservation) => {
-  if (action.direction) {
-    return action.direction;
+const readPromptThoughtDirective = (prompt: string) => {
+  const explicitMatch = prompt.match(/thought(?:\s*[:=]|\s+is\s+)\s*"([^"]{1,90})"/i);
+  if (explicitMatch?.[1]) {
+    return clipThought(explicitMatch[1]);
   }
-  const target = findTargetById(observation.visibleEntities, action.entityId) ?? chooseTarget(observation.visibleEntities);
-  if (target) {
-    return target.direction;
-  }
-  const immediateObstacle = observation.obstacleHints.find((hint) => hint.distance < 90);
-  if (immediateObstacle) {
-    return immediateObstacle.direction;
-  }
-  return "right" as const;
+  return undefined;
 };
 
-const inferDistance = (action: StructuredAction, observation: ViewObservation, fallback: number, max: number) => {
-  if (action.distance !== undefined) {
-    return action.distance;
+const parseMoveDirection = (value: string | undefined): MoveDirection | undefined => {
+  if (value === "forward" || value === "backward" || value === "left" || value === "right") {
+    return value;
   }
-  const target = findTargetById(observation.visibleEntities, action.entityId) ?? chooseTarget(observation.visibleEntities);
-  if (target) {
-    return clamp(Math.round(target.distance * 0.45), 40, max);
-  }
-  const immediateObstacle = observation.obstacleHints.find((hint) => hint.direction === inferDirection(action, observation));
-  if (immediateObstacle) {
-    return clamp(immediateObstacle.distance + 48, 40, max);
-  }
-  return fallback;
+  return undefined;
 };
 
-const actionToToolInvocation = (action: StructuredAction, observation: ViewObservation): ToolInvocation | undefined => {
+const parseTurnDirection = (value: string | undefined): TurnDirection | undefined => {
+  if (value === "left" || value === "right") {
+    return value;
+  }
+  return undefined;
+};
+
+const readPromptActionDirective = (prompt: string): ToolInvocation | undefined => {
+  const actionType = prompt.match(/action\.type\s*=\s*["']?([a-z_]+)["']?/i)?.[1]?.toLowerCase();
+  const direction = prompt.match(/direction\s*=\s*["']?([a-z_]+)["']?/i)?.[1]?.toLowerCase();
+  const steps = Number(prompt.match(/steps\s*=\s*(\d+)/i)?.[1] ?? Number.NaN);
+  const blockType = prompt.match(/blocktype\s*=\s*["']?(stone|wood|glass)["']?/i)?.[1]?.toLowerCase() as
+    | BuildBlockType
+    | undefined;
+  const dx = Number(prompt.match(/dx\s*=\s*(-?\d+)/i)?.[1] ?? Number.NaN);
+  const dy = Number(prompt.match(/dy\s*=\s*(-?\d+)/i)?.[1] ?? Number.NaN);
+  const dz = Number(prompt.match(/dz\s*=\s*(-?\d+)/i)?.[1] ?? Number.NaN);
+  const normalized = prompt.toLowerCase();
+
+  if (actionType === "wait" || /hold position|stay still|do not move|wait/.test(normalized)) {
+    return undefined;
+  }
+
+  if (actionType === "inspect_patch") {
+    return { name: "inspect_patch", args: {} };
+  }
+
+  if (actionType === "turn") {
+    const turnDirection = parseTurnDirection(direction);
+    if (turnDirection) {
+      return { name: "turn", args: { direction: turnDirection } };
+    }
+  }
+
+  if (actionType === "move") {
+    const moveDirection = parseMoveDirection(direction);
+    if (moveDirection) {
+      return { name: "move", args: { direction: moveDirection, steps: Number.isFinite(steps) ? steps : 1 } };
+    }
+  }
+
+  if (actionType === "place_block" && blockType) {
+    return {
+      name: "place_block",
+      args: {
+        blockType,
+        dx: Number.isFinite(dx) ? dx : 0,
+        dy: Number.isFinite(dy) ? dy : 1,
+        dz: Number.isFinite(dz) ? dz : 1,
+      },
+    };
+  }
+
+  if (actionType === "remove_block") {
+    return {
+      name: "remove_block",
+      args: {
+        dx: Number.isFinite(dx) ? dx : 0,
+        dy: Number.isFinite(dy) ? dy : 1,
+        dz: Number.isFinite(dz) ? dz : 1,
+      },
+    };
+  }
+
+  return undefined;
+};
+
+const readPromptOverride = (prompt: string): PromptOverride | undefined => {
+  const overridePrefix = prompt.match(/^\s*(?:@override|override:)\s*/i);
+  if (!overridePrefix) {
+    return undefined;
+  }
+
+  const directiveBody = prompt.slice(overridePrefix[0].length);
+  const thought = readPromptThoughtDirective(directiveBody);
+  const toolCall = readPromptActionDirective(directiveBody);
+  if (thought === undefined && toolCall === undefined && !/wait|hold position|stay still|do not move/i.test(directiveBody)) {
+    return undefined;
+  }
+
+  return {
+    ...(thought !== undefined ? { thought } : {}),
+    ...(toolCall !== undefined ? { toolCall } : {}),
+  };
+};
+
+const findReachableCell = (observation: ViewObservation, dx: number, dy: number, dz: number) =>
+  observation.reachableCells.find((cell) => cell.dx === dx && cell.dy === dy && cell.dz === dz);
+
+const isBuildableCell = (observation: ViewObservation, dx: number, dy: number, dz: number) =>
+  !(dx === 0 && dy === 0 && dz === 1) &&
+  Boolean(findReachableCell(observation, dx, dy, dz)?.supported) &&
+  findReachableCell(observation, dx, dy, dz)?.current === "empty" &&
+  dz >= 1;
+
+const isRemovableCell = (observation: ViewObservation, dx: number, dy: number, dz: number) => {
+  const cell = findReachableCell(observation, dx, dy, dz);
+  if (!cell) {
+    return false;
+  }
+  return cell.current !== "empty" && cell.current !== "grass";
+};
+
+const sortedBuildableCells = (observation: ViewObservation) =>
+  [...observation.reachableCells]
+    .filter((cell) => isBuildableCell(observation, cell.dx, cell.dy, cell.dz))
+    .sort((left, right) => left.dy - right.dy || Math.abs(left.dx) - Math.abs(right.dx) || left.dx - right.dx || left.dz - right.dz);
+
+const sortedRemovableCells = (observation: ViewObservation) =>
+  [...observation.reachableCells]
+    .filter((cell) => isRemovableCell(observation, cell.dx, cell.dy, cell.dz))
+    .sort((left, right) => left.dz - right.dz || left.dy - right.dy || Math.abs(left.dx) - Math.abs(right.dx) || left.dx - right.dx);
+
+const inferObjectiveKind = (objective: string) => {
+  const normalized = objective.toLowerCase();
+  if (/\b(tower|column|pillar|stack)\b/.test(normalized)) {
+    return "tower";
+  }
+  if (/\b(2x2|square|pad|platform)\b/.test(normalized)) {
+    return "pad";
+  }
+  if (/\b(row|line)\b/.test(normalized)) {
+    return "row";
+  }
+  if (/\b(remove|clear|delete)\b/.test(normalized)) {
+    return "remove";
+  }
+  return "generic";
+};
+
+const normalizeToolInvocation = (
+  toolCall: ToolInvocation | undefined,
+  observation: ViewObservation,
+  objective: string,
+): ToolInvocation | undefined => {
+  if (!toolCall) {
+    return undefined;
+  }
+
+  if (toolCall.name === "place_block") {
+    if (isBuildableCell(observation, toolCall.args.dx, toolCall.args.dy, toolCall.args.dz)) {
+      return toolCall;
+    }
+
+    const objectiveKind = inferObjectiveKind(objective);
+    const buildable = sortedBuildableCells(observation);
+    if (buildable.length === 0) {
+      return { name: "inspect_patch", args: {} };
+    }
+
+    const candidate =
+      objectiveKind === "tower"
+        ? [...buildable].sort((left, right) => left.dy - right.dy || Math.abs(left.dx) - Math.abs(right.dx) || left.dx - right.dx || right.dz - left.dz)[0]
+        : objectiveKind === "row" || objectiveKind === "pad"
+          ? buildable.find((cell) => cell.dz === 1) ?? buildable[0]
+          : buildable[0];
+
+    if (!candidate) {
+      return { name: "inspect_patch", args: {} };
+    }
+
+    return {
+      name: "place_block",
+      args: {
+        blockType: toolCall.args.blockType,
+        dx: candidate.dx,
+        dy: candidate.dy,
+        dz: candidate.dz,
+      },
+    };
+  }
+
+  if (toolCall.name === "remove_block") {
+    if (isRemovableCell(observation, toolCall.args.dx, toolCall.args.dy, toolCall.args.dz)) {
+      return toolCall;
+    }
+    const candidate = sortedRemovableCells(observation)[0];
+    return candidate
+      ? { name: "remove_block", args: { dx: candidate.dx, dy: candidate.dy, dz: candidate.dz } }
+      : { name: "inspect_patch", args: {} };
+  }
+
+  return toolCall;
+};
+
+const moveDeltaForDirection = (facing: Facing, direction: MoveDirection) => {
+  switch (facing) {
+    case "north":
+      return direction === "forward"
+        ? { x: 0, y: -1 }
+        : direction === "backward"
+          ? { x: 0, y: 1 }
+          : direction === "left"
+            ? { x: -1, y: 0 }
+            : { x: 1, y: 0 };
+    case "east":
+      return direction === "forward"
+        ? { x: 1, y: 0 }
+        : direction === "backward"
+          ? { x: -1, y: 0 }
+          : direction === "left"
+            ? { x: 0, y: -1 }
+            : { x: 0, y: 1 };
+    case "south":
+      return direction === "forward"
+        ? { x: 0, y: 1 }
+        : direction === "backward"
+          ? { x: 0, y: -1 }
+          : direction === "left"
+            ? { x: 1, y: 0 }
+            : { x: -1, y: 0 };
+    case "west":
+      return direction === "forward"
+        ? { x: -1, y: 0 }
+        : direction === "backward"
+          ? { x: 1, y: 0 }
+          : direction === "left"
+            ? { x: 0, y: 1 }
+            : { x: 0, y: -1 };
+  }
+};
+
+const worldStepToLocalMove = (facing: Facing, deltaX: number, deltaY: number): MoveDirection | undefined => {
+  const directions: readonly MoveDirection[] = ["forward", "backward", "left", "right"];
+  return directions.find((direction) => {
+    const delta = moveDeltaForDirection(facing, direction);
+    return delta.x === deltaX && delta.y === deltaY;
+  });
+};
+
+const nextTurnToward = (facing: Facing, desired: Facing): TurnDirection => {
+  const order: readonly Facing[] = ["north", "east", "south", "west"];
+  const fromIndex = order.indexOf(facing);
+  const toIndex = order.indexOf(desired);
+  const rightSteps = (toIndex - fromIndex + order.length) % order.length;
+  const leftSteps = (fromIndex - toIndex + order.length) % order.length;
+  return rightSteps <= leftSteps ? "right" : "left";
+};
+
+const buildFallbackAction = (_observation: ViewObservation): ToolInvocation | undefined => undefined;
+
+const readStubPromptDirective = (prompt: string): ToolInvocation | undefined => {
+  const normalized = prompt.toLowerCase();
+  if (/inspect_patch|inspect|scan/.test(normalized)) {
+    return { name: "inspect_patch", args: {} };
+  }
+  if (/hold position|stay still|do not move|wait/.test(normalized)) {
+    return undefined;
+  }
+  if (/turn left/.test(normalized)) {
+    return { name: "turn", args: { direction: "left" } };
+  }
+  if (/turn right/.test(normalized)) {
+    return { name: "turn", args: { direction: "right" } };
+  }
+  if (/move forward/.test(normalized)) {
+    return { name: "move", args: { direction: "forward", steps: 1 } };
+  }
+  if (/move backward/.test(normalized)) {
+    return { name: "move", args: { direction: "backward", steps: 1 } };
+  }
+  if (/move left/.test(normalized)) {
+    return { name: "move", args: { direction: "left", steps: 1 } };
+  }
+  if (/move right/.test(normalized)) {
+    return { name: "move", args: { direction: "right", steps: 1 } };
+  }
+  return undefined;
+};
+
+const inferMoveDirection = (_observation: ViewObservation): MoveDirection => "forward";
+
+const inferBlockType = (contextText: string, reason?: string): BuildBlockType => {
+  const normalized = `${contextText} ${reason ?? ""}`.toLowerCase();
+  if (normalized.includes("glass")) {
+    return "glass";
+  }
+  if (normalized.includes("wood")) {
+    return "wood";
+  }
+  return "stone";
+};
+
+const parseJsonObject = (raw: string | undefined) => {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return parsed;
+  } catch {
+    return {};
+  }
+};
+
+const parseNativeToolInvocation = (
+  toolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall | undefined,
+  observation: ViewObservation,
+  contextText: string,
+): ToolInvocation | undefined => {
+  if (!toolCall || toolCall.type !== "function") {
+    return undefined;
+  }
+
+  const args = parseJsonObject(toolCall.function.arguments);
+  const name = toolCall.function.name as NativeToolName;
+
+  switch (name) {
+    case "wait":
+      return undefined;
+    case "inspect_patch":
+      return { name: "inspect_patch", args: {} };
+    case "turn": {
+      const direction = parseTurnDirection(typeof args.direction === "string" ? args.direction : undefined);
+      return {
+        name: "turn",
+        args: {
+          direction: direction ?? "left",
+        },
+      };
+    }
+    case "move": {
+      const direction = parseMoveDirection(typeof args.direction === "string" ? args.direction : undefined);
+      const steps = typeof args.steps === "number" ? args.steps : undefined;
+      return {
+        name: "move",
+        args: {
+          direction: direction ?? inferMoveDirection(observation),
+          steps: clampInt(steps, 1, 2, 1),
+        },
+      };
+    }
+    case "place_block": {
+      const blockType =
+        typeof args.blockType === "string" && (args.blockType === "stone" || args.blockType === "wood" || args.blockType === "glass")
+          ? args.blockType
+          : undefined;
+      return {
+        name: "place_block",
+        args: {
+          blockType: blockType ?? inferBlockType(contextText),
+          dx: clampInt(typeof args.dx === "number" ? args.dx : undefined, -1, 1, 0),
+          dy: clampInt(typeof args.dy === "number" ? args.dy : undefined, 0, 3, 1),
+          dz: clampInt(typeof args.dz === "number" ? args.dz : undefined, 1, 3, 1),
+        },
+      };
+    }
+    case "remove_block":
+      return {
+        name: "remove_block",
+        args: {
+          dx: clampInt(typeof args.dx === "number" ? args.dx : undefined, -1, 1, 0),
+          dy: clampInt(typeof args.dy === "number" ? args.dy : undefined, 0, 3, 1),
+          dz: clampInt(typeof args.dz === "number" ? args.dz : undefined, 0, 3, 1),
+        },
+      };
+    default:
+      return undefined;
+  }
+};
+
+const actionToToolInvocation = (
+  action: StructuredAction,
+  observation: ViewObservation,
+  contextText: string,
+): ToolInvocation | undefined => {
   switch (action.type) {
     case "wait":
       return undefined;
-    case "inspect_view":
-      return { name: "inspect_view", args: {} };
-    case "move":
-      if (action.entityId && (action.direction === undefined || action.distance === undefined)) {
-        return {
-          name: "approach_entity",
-          args: Schema.decodeUnknownSync(ApproachArgs)({
-            entityId: action.entityId,
-            stopWithin: action.stopWithin ?? 72,
-          }),
-        };
-      }
+    case "inspect_patch":
+      return { name: "inspect_patch", args: {} };
+    case "turn": {
+      const direction = parseTurnDirection(action.direction);
       return {
-        name: "move",
-        args: Schema.decodeUnknownSync(MoveArgs)({
-          direction: inferDirection(action, observation),
-          distance: inferDistance(action, observation, 80, 240),
-        }),
-      };
-    case "jump":
-      return {
-        name: "jump",
-        args: Schema.decodeUnknownSync(JumpArgs)({
-          direction: inferDirection(action, observation),
-          distance: inferDistance(action, observation, 120, 220),
-          strength: action.strength ?? 320,
-        }),
-      };
-    case "approach_entity": {
-      const targetId =
-        action.entityId ??
-        findTargetById(observation.visibleEntities, action.entityId)?.id ??
-        chooseTarget(observation.visibleEntities)?.id;
-      if (!targetId) {
-        return undefined;
-      }
-      return {
-        name: "approach_entity",
-        args: Schema.decodeUnknownSync(ApproachArgs)({
-          entityId: targetId,
-          stopWithin: action.stopWithin ?? 72,
-        }),
+        name: "turn",
+        args: {
+          direction: direction ?? "left",
+        },
       };
     }
+    case "move": {
+      const direction = parseMoveDirection(action.direction);
+      return {
+        name: "move",
+        args: {
+          direction: direction ?? inferMoveDirection(observation),
+          steps: clampInt(action.steps, 1, 2, 1),
+        },
+      };
+    }
+    case "place_block":
+      return {
+        name: "place_block",
+        args: {
+          blockType: inferBlockType(contextText, action.reason),
+          dx: clampInt(action.dx, -1, 1, 0),
+          dy: clampInt(action.dy, 0, 3, 1),
+          dz: clampInt(action.dz, 1, 3, 1),
+        },
+      };
+    case "remove_block":
+      return {
+        name: "remove_block",
+        args: {
+          dx: clampInt(action.dx, -1, 1, 0),
+          dy: clampInt(action.dy, 0, 3, 1),
+          dz: clampInt(action.dz, 0, 3, 1),
+        },
+      };
   }
 };
 
-const makeStubThought = (input: BrainInput, toolCall?: ToolInvocation, toolResult?: string) => {
-  const directedThought = readPromptThoughtDirective(input.entity.prompt);
-  if (directedThought) {
-    return directedThought;
-  }
-  if (toolCall?.name === "approach_entity") {
-    return `Closing on ${toolCall.args.entityId}; keeping line of sight.`;
-  }
-  if (toolCall?.name === "jump") {
-    return `Jumping ${toolCall.args.direction}; geometry is getting tight.`;
-  }
+const makeStubThought = (toolCall?: ToolInvocation, toolResult?: string) => {
   if (toolCall?.name === "move") {
-    return `Walking ${toolCall.args.direction} ${toolCall.args.distance}px.`;
+    return `Moving ${toolCall.args.direction} to explore the build plate.`;
+  }
+  if (toolCall?.name === "turn") {
+    return `Turning ${toolCall.args.direction} to reframe the workspace.`;
+  }
+  if (toolCall?.name === "place_block") {
+    return `Placing ${toolCall.args.blockType} at the selected local cell.`;
+  }
+  if (toolCall?.name === "remove_block") {
+    return "Removing a block from the local patch.";
+  }
+  if (toolCall?.name === "inspect_patch") {
+    return "Inspecting the local build patch.";
   }
   if (toolResult) {
     return toolResult;
   }
-  return input.observation.urgentHints[0] ?? "Scanning the room.";
+  return "Awaiting the next objective.";
+};
+
+const decodeStructuredDecision = (rawResponse: string): StructuredDecision => {
+  const parsed = JSON.parse(rawResponse) as unknown;
+  return Schema.decodeUnknownSync(StructuredDecisionSchema)(parsed);
 };
 
 export class BrainAdapter {
@@ -515,101 +970,60 @@ export class BrainAdapter {
 
   async #runStubTurn(input: BrainInput): Promise<BrainResult> {
     const started = performance.now();
-    const requestTranscriptText = [
-      "[system]",
-      `Stub fallback for ${input.entity.name}.`,
-      "",
-      "[user]",
-      input.observation.promptText,
-      "[image attached detail=low]",
-    ].join("\n");
-    const threadEntries: ThreadMessage[] = [buildObservationHistoryEntry(input.observation)];
-    let toolCall: ToolInvocation | undefined;
-    let toolResult: string | undefined;
+    const requestTranscriptText = renderTurnContext({
+      objective: clipText(input.entity.prompt, 420),
+      memorySummary: input.entity.memorySummary,
+      thread: input.thread,
+      observationText: input.observation.promptText,
+      withImage: false,
+    });
 
-    const promptDirectedTool = readStubPromptDirective(input.entity.prompt, input.observation);
+    const threadEntries: ThreadMessage[] = [];
+    const promptDirectedTool = readStubPromptDirective(input.entity.prompt);
+    const toolCall = promptDirectedTool ?? buildFallbackAction(input.observation);
+    const toolResult = toolCall ? await input.toolExecutor(toolCall) : "Builder is holding position.";
+    const thought = normalizePublicThought(makeStubThought(toolCall, toolResult), "Builder is holding position.");
 
-    if (promptDirectedTool !== undefined || /wait|hold position|stay still|do nothing/i.test(input.entity.prompt)) {
-      toolCall = promptDirectedTool;
-    } else {
-      const immediateObstacle = input.observation.obstacleHints.find((hint) => hint.distance < 90 && hint.jumpRecommended);
-      const target = chooseTarget(input.observation.visibleEntities);
-
-      if (immediateObstacle) {
-        toolCall = {
-          name: "jump",
-          args: {
-            direction: immediateObstacle.direction,
-            distance: 120,
-            strength: 320,
-          },
-        };
-      } else if (target) {
-        toolCall = {
-          name: "approach_entity",
-          args: {
-            entityId: target.id,
-            stopWithin: target.distance > 140 ? 90 : 42,
-          },
-        };
-      } else {
-        toolCall = {
-          name: "move",
-          args: {
-            direction: Math.random() > 0.5 ? "right" : "left",
-            distance: 80,
-          },
-        };
-      }
-    }
-
-    toolResult = toolCall ? await input.toolExecutor(toolCall) : "Holding position by prompt directive.";
-    const thought = normalizePublicThought(makeStubThought(input, toolCall, toolResult), "Holding position.");
     threadEntries.push({
       role: "assistant",
       content: summarizeTurn(thought, toolCall, toolResult),
     });
 
-    const rawModelOutput = JSON.stringify({
-      thought,
-      action:
-        toolCall === undefined
-          ? { type: "wait", reason: "stub fallback" }
-          : { type: toolCall.name, ...toolCall.args },
-    });
-
     return {
+      objectiveRevision: input.entity.objectiveRevision,
       thought,
       threadEntries,
-      rawModelOutput,
+      rawModelOutput: JSON.stringify(
+        {
+          source: "stub_builder_policy",
+          thought,
+          action: toolCall === undefined ? { type: "wait", reason: "stub fallback" } : { type: toolCall.name, ...toolCall.args },
+        },
+        null,
+        2,
+      ),
       requestTranscriptText,
       latencyMs: performance.now() - started,
       mode: "stub",
-      viewportImageDataUrl: input.observation.viewportImageDataUrl,
       ...(toolCall !== undefined ? { toolCall } : {}),
       ...(toolResult !== undefined ? { toolResult } : {}),
     };
   }
 
-  async #runPromptOverrideTurn(
-    input: BrainInput,
-    override: PromptOverride,
-    mode: LlmStatus["mode"],
-  ): Promise<BrainResult> {
+  async #runPromptOverrideTurn(input: BrainInput, override: PromptOverride, mode: LlmStatus["mode"]): Promise<BrainResult> {
     const started = performance.now();
-    const requestTranscriptText = [
-      "[system]",
-      `Prompt override for ${input.entity.name}.`,
-      "",
-      "[user]",
-      input.observation.promptText,
-      "[image attached detail=low]",
-    ].join("\n");
-    const threadEntries: ThreadMessage[] = [buildObservationHistoryEntry(input.observation)];
-    const toolResult = override.toolCall ? await input.toolExecutor(override.toolCall) : "Holding position by prompt directive.";
+    const requestTranscriptText = renderTurnContext({
+      objective: clipText(input.entity.prompt, 420),
+      memorySummary: input.entity.memorySummary,
+      thread: input.thread,
+      observationText: input.observation.promptText,
+      withImage: false,
+    });
+    const threadEntries: ThreadMessage[] = [];
+    const toolResult = override.toolCall ? await input.toolExecutor(override.toolCall) : "Holding position by prompt override.";
     const thought = normalizePublicThought(
-      override.thought ?? makeStubThought(input, override.toolCall, toolResult),
-      "Holding position by prompt directive.",
+      override.thought ?? makeStubThought(override.toolCall, toolResult),
+      "Holding position by prompt override.",
     );
     threadEntries.push({
       role: "assistant",
@@ -617,6 +1031,7 @@ export class BrainAdapter {
     });
 
     return {
+      objectiveRevision: input.entity.objectiveRevision,
       thought,
       threadEntries,
       rawModelOutput: JSON.stringify(
@@ -631,13 +1046,22 @@ export class BrainAdapter {
       requestTranscriptText,
       latencyMs: performance.now() - started,
       mode,
-      viewportImageDataUrl: input.observation.viewportImageDataUrl,
       ...(override.toolCall !== undefined ? { toolCall: override.toolCall } : {}),
       ...(toolResult !== undefined ? { toolResult } : {}),
     };
   }
 
   async runTurn(input: BrainInput): Promise<BrainResult> {
+    if (input.entity.prompt.trim().length === 0) {
+      return this.#runPromptOverrideTurn(
+        input,
+        {
+          thought: "Awaiting an objective.",
+        },
+        this.#status.activeModel ? "lmstudio" : "stub",
+      );
+    }
+
     const promptOverride = readPromptOverride(input.entity.prompt);
     if (promptOverride) {
       return this.#runPromptOverrideTurn(input, promptOverride, this.#status.activeModel ? "lmstudio" : "stub");
@@ -653,79 +1077,85 @@ export class BrainAdapter {
     }
 
     const started = performance.now();
-    const threadEntries: ThreadMessage[] = [buildObservationHistoryEntry(input.observation)];
+    const threadEntries: ThreadMessage[] = [];
+    const thinkDirective = shouldAppendThinkDirective(model) ? "\n/think" : "";
+    const toolMode = this.config.toolMode ?? "auto";
+    const imageMode = this.config.imageMode ?? "auto";
+    const includeImage = shouldAttachViewport(input, imageMode);
+    const temperature = this.config.temperature ?? 0.1;
+    const maxTokens = this.config.maxTokens ?? 80;
+    const topP = this.config.topP ?? 0.9;
 
     const systemPrompt = [
-      `You are ${input.entity.name} (${input.entity.id}) in a side-view simulation harness.`,
-      `Compressed earlier context: ${clipText(input.entity.memorySummary, 220)}`,
-      "The latest user message contains an OPERATOR DIRECTIVE. Treat it as the current objective and style update.",
-      "You receive up to four recent turns of chat history plus the latest viewport image.",
-      "Return one JSON object with a short public thought and one action.",
-      "Use action.type='wait' if no action is needed.",
-      "If action.type is move or jump, include direction and distance.",
-      "If action.type is approach_entity, include entityId and stopWithin.",
-      "Prefer short moves and only jump when obstacle advisories indicate it is needed.",
-      "If the latest observation includes repeat_warning or blocked movement, do not repeat the same action and args.",
-      "When stuck, inspect_view or choose a materially different action type or direction.",
-      "Use visible entity IDs when selecting a target.",
-      "Keep thought under 90 characters.",
+      `You are ${input.entity.name} (${input.entity.id}) in a tiny block-building sandbox.`,
+      "Treat the current objective as authoritative. Follow it even if it differs from older turns.",
+      "You only control one local action per turn. The runtime is authoritative.",
+      "Relative coordinates are in your local frame. dx is left/right, dy is forward, dz is height above the floor under you.",
+      "There is no default build goal. Only act on the current objective from the operator.",
+      "Structured text is authoritative for coordinates, occupancy, and support.",
+      "When viewport markers are present, use the numeric beacon markers in the image together with the viewport_markers text.",
+      "For place_block, choose only cells listed in buildable_cells.",
+      "Never place into blocked_place_cells or grass. dz=1 is the first build layer above the floor.",
+      "If a placement failed, pick a different buildable cell or move before placing again.",
+      "Use inspect_patch when the local state is unclear before building.",
+      "Do not repeat a failed action unchanged.",
+      "Keep any public thought short and concrete.",
     ].join("\n");
-
-    const historyMessages = buildHistoryMessages(input.thread);
-    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+    const buildMessages = (withImage: boolean): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => [
       { role: "system", content: systemPrompt },
-      ...historyMessages,
       {
         role: "user",
         content: [
           {
             type: "text",
-            text: `operator_directive=${input.entity.prompt}\n${input.observation.promptText}\nviewport=attached`,
+            text:
+              `${buildTurnSections({
+                objective: clipText(input.entity.prompt, 420),
+                memorySummary: input.entity.memorySummary,
+                thread: input.thread,
+                observationText: input.observation.promptText,
+              }).join("\n\n")}\n\n` + `[viewport]\n${withImage ? "attached" : "text-only"}${thinkDirective}`,
           },
-          {
-            type: "image_url",
-            image_url: {
-              url: input.observation.viewportImageDataUrl,
-              detail: "low",
-            },
-          },
+          ...(withImage
+            ? [
+                {
+                  type: "image_url" as const,
+                  image_url: {
+                    url: input.observation.viewportImageDataUrl,
+                    detail: "low" as const,
+                  },
+                },
+              ]
+            : []),
         ],
       },
     ];
-    const requestTranscriptText = renderRequestTranscript(messages);
 
-    try {
-      const response = await this.#client.chat.completions.create({
-        model,
-        messages,
-        response_format: structuredDecisionFormat,
-        temperature: 0.2,
-        max_tokens: 96,
-      });
-      const rawModelOutput = readContent(response.choices[0]?.message?.content);
-      if (!rawModelOutput) {
-        throw new Error("Model returned an empty structured response.");
-      }
-      const decision = decodeStructuredDecision(rawModelOutput);
-      const toolCall = actionToToolInvocation(decision.action, input.observation);
-      const toolResult = toolCall ? await input.toolExecutor(toolCall) : decision.action.reason ?? "No action requested.";
-      const fallbackThought = toolCall
-        ? makeStubThought(input, toolCall, toolResult)
-        : decision.action.reason ?? makeStubThought(input);
-      const thought = normalizePublicThought(decision.thought, fallbackThought);
-      const completionTokens = response.usage?.completion_tokens ?? 0;
+    const finalizeTurn = async (
+      requestTranscriptText: string,
+      rawModelOutput: string,
+      thoughtCandidate: string,
+      toolCall: ToolInvocation | undefined,
+      completionTokens: number,
+    ): Promise<BrainResult> => {
+      const normalizedToolCall = normalizeToolInvocation(toolCall, input.observation, input.entity.prompt);
+      const toolResult = normalizedToolCall ? await input.toolExecutor(normalizedToolCall) : "No action requested.";
+      const fallbackThought = makeStubThought(normalizedToolCall, toolResult);
+      const thought = normalizePublicThought(thoughtCandidate, fallbackThought);
+      const latencyMs = performance.now() - started;
+      const completionTokensPerSecond = completionTokens > 0 && latencyMs > 0 ? (completionTokens / latencyMs) * 1000 : undefined;
 
       threadEntries.push({
         role: "assistant",
         content: summarizeTurn(thought, toolCall, toolResult),
       });
-      const latencyMs = performance.now() - started;
-      const completionTokensPerSecond = completionTokens > 0 && latencyMs > 0 ? (completionTokens / latencyMs) * 1000 : undefined;
+
       this.#status.mode = "lmstudio";
       this.#status.activeModel = model;
       delete this.#status.lastError;
 
       return {
+        objectiveRevision: input.entity.objectiveRevision,
         thought,
         threadEntries,
         rawModelOutput,
@@ -733,12 +1163,114 @@ export class BrainAdapter {
         latencyMs,
         mode: "lmstudio",
         activeModel: model,
-        viewportImageDataUrl: input.observation.viewportImageDataUrl,
-        ...(toolCall !== undefined ? { toolCall } : {}),
+        ...(includeImage ? { viewportImageDataUrl: input.observation.viewportImageDataUrl } : {}),
+        ...(normalizedToolCall !== undefined ? { toolCall: normalizedToolCall } : {}),
         ...(toolResult !== undefined ? { toolResult } : {}),
         ...(completionTokens > 0 ? { completionTokens } : {}),
         ...withOptionalNumber("completionTokensPerSecond", completionTokensPerSecond),
       };
+    };
+
+    const attemptToolTurn = async (withImage: boolean) => {
+      const messages = buildMessages(withImage);
+      const requestTranscriptText = renderTurnContext({
+        objective: clipText(input.entity.prompt, 420),
+        memorySummary: input.entity.memorySummary,
+        thread: input.thread,
+        observationText: input.observation.promptText,
+        withImage,
+      });
+      const response = await this.#client.chat.completions.create({
+        model,
+        messages,
+        tools: nativeTools,
+        tool_choice: "required",
+        parallel_tool_calls: false,
+        temperature,
+        top_p: topP,
+        max_tokens: maxTokens,
+      });
+      const message = response.choices[0]?.message;
+      if (!message) {
+        throw new Error("Model returned no assistant message.");
+      }
+
+      const reasoningTrace = readReasoningContent(message);
+      const thoughtCandidate = reasoningTrace || readContent(message);
+      const toolCall = parseNativeToolInvocation(message.tool_calls?.[0], input.observation, thoughtCandidate);
+      const rawModelOutput = JSON.stringify(
+        {
+          content: readAssistantTextContent(message),
+          reasoning_content: reasoningTrace,
+          tool_calls: message.tool_calls ?? [],
+        },
+        null,
+        2,
+      );
+      if (!message.tool_calls?.length) {
+        throw new Error("Model returned no tool call.");
+      }
+      return finalizeTurn(requestTranscriptText, rawModelOutput, thoughtCandidate, toolCall, response.usage?.completion_tokens ?? 0);
+    };
+
+    const attemptStructuredTurn = async (withImage: boolean) => {
+      const messages = buildMessages(withImage);
+      const requestTranscriptText = renderTurnContext({
+        objective: clipText(input.entity.prompt, 420),
+        memorySummary: input.entity.memorySummary,
+        thread: input.thread,
+        observationText: input.observation.promptText,
+        withImage,
+      });
+      const response = await this.#client.chat.completions.create({
+        model,
+        messages,
+        response_format: structuredDecisionFormat,
+        temperature,
+        top_p: topP,
+        max_tokens: Math.max(maxTokens, 120),
+      });
+      const message = response.choices[0]?.message;
+      if (!message) {
+        throw new Error("Model returned no assistant message.");
+      }
+      const rawModelOutput = readContent(message);
+      if (!rawModelOutput) {
+        throw new Error("Model returned an empty structured response.");
+      }
+
+      const decision = decodeStructuredDecision(rawModelOutput);
+      const toolCall = actionToToolInvocation(decision.action, input.observation, decision.thought);
+      return finalizeTurn(requestTranscriptText, rawModelOutput, decision.thought, toolCall, response.usage?.completion_tokens ?? 0);
+    };
+
+    const attemptWithFallback = async <T,>(run: (withImage: boolean) => Promise<T>) => {
+      try {
+        return await run(includeImage);
+      } catch (error) {
+        if (includeImage && isImageProcessingError(error)) {
+          return run(false);
+        }
+        throw error;
+      }
+    };
+
+    try {
+      if (toolMode === "native") {
+        return await attemptWithFallback(attemptToolTurn);
+      }
+      if (toolMode === "json") {
+        return await attemptWithFallback(attemptStructuredTurn);
+      }
+
+      try {
+        return await attemptWithFallback(attemptToolTurn);
+      } catch (toolError) {
+        if (!isToolCallingError(toolError) && !isImageProcessingError(toolError)) {
+          throw toolError;
+        }
+        return await attemptWithFallback(attemptStructuredTurn);
+      }
     } catch (error) {
       this.#status.mode = "stub";
       this.#status.lastError = error instanceof Error ? error.message : String(error);

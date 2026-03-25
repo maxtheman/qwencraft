@@ -2,6 +2,10 @@
 
 `qwencraft` is a local LLM-driven block-building sandbox.
 
+Current version: `0.1.0`
+
+License: `MIT`
+
 The current repo proves the loop:
 
 - Effect-driven simulation and agent turns
@@ -118,6 +122,7 @@ npm run profile:lmstudio
 - [docs/poc-scope.md](/Users/max/Documents/agent_game/docs/poc-scope.md)
 - [docs/current-direction.md](/Users/max/Documents/agent_game/docs/current-direction.md)
 - [docs/block-world-pivot.md](/Users/max/Documents/agent_game/docs/block-world-pivot.md)
+- [docs/versioning.md](/Users/max/Documents/agent_game/docs/versioning.md)
 
 ## Notes
 

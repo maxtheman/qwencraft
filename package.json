@@ -1,6 +1,6 @@
 {
   "name": "agent_game",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Local LLM-driven 2D harness debug runtime",
   "type": "module",
   "directories": {
@@ -14,6 +14,9 @@
     "test": "tsx --test src/**/*.test.ts",
     "profile:lmstudio": "tsx src/server/profile.ts",
     "harness:headless": "tsx src/server/headless.ts",
+    "version:patch": "npm version patch --no-git-tag-version",
+    "version:minor": "npm version minor --no-git-tag-version",
+    "version:major": "npm version major --no-git-tag-version",
     "start": "tsx src/server/main.ts"
   },
   "keywords": [],
